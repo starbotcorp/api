@@ -1,0 +1,45 @@
+# Systemd service file for Starbot API
+# Place at: /etc/systemd/system/starbot-api.service
+#
+# Enable: sudo systemctl enable starbot-api
+# Start:  sudo systemctl start starbot-api
+# Status: sudo systemctl status starbot-api
+# Logs:   sudo journalctl -u starbot-api -f
+
+[Unit]
+Description=Starbot API Service
+After=network.target
+
+[Service]
+Type=simple
+User=stella
+Group=stella
+WorkingDirectory=/home/stella/starbot-api
+EnvironmentFile=-/home/stella/starbot-api/.env
+EnvironmentFile=-/home/stella/starbot-api/.env.runtime
+Environment="NODE_ENV=production"
+Environment="PORT=3737"
+Environment="HOST=0.0.0.0"
+
+# Start command
+ExecStart=/usr/bin/env HOST=0.0.0.0 /usr/bin/node /home/stella/starbot-api/dist/index.js
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=starbot-api
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+PrivateDevices=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
