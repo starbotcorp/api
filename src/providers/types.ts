@@ -21,6 +21,7 @@ export interface ProviderTool {
 }
 
 export interface ProviderMessage {
+  type?: 'message'; // Required by DeepSeek API
   role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
   tool_calls?: ToolCall[]; // For assistant messages with tool calls

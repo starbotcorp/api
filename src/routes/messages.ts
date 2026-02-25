@@ -17,47 +17,58 @@ export const InternalMessageSchema = z.object({
   content: z.string().min(1),
 });
 
-const UpdateMessageSchema = z.object({
-  content: z.string().min(1),
-});
-
 export async function messageRoutes(server: FastifyInstance) {
-  // GET /v1/chats/:chatId/messages - List messages in a chat
-  server.get<{ Params: { chatId: string } }>(
-    '/chats/:chatId/messages',
-    async (request, reply) => {
-      const { chatId } = request.params;
-
-      const messages = await prisma.message.findMany({
-        where: { chatId },
-        orderBy: { createdAt: 'asc' },
-      });
-
-      return { messages };
-    }
-  );
-
   // POST /v1/chats/:chatId/messages - Add a message to a chat
   server.post<{ Params: { chatId: string } }>(
     '/chats/:chatId/messages',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          required: ['role', 'content'],
+          properties: {
+            role: { type: 'string', enum: ['user', 'assistant'] },
+            content: { type: 'string', minLength: 1 },
+          },
+        },
+      },
+    },
     async (request, reply) => {
+      // Log request entry
+      console.log('[POST /messages] Request received:', {
+        chatId: request.params.chatId,
+        contentType: request.headers['content-type'],
+        bodyExists: request.body !== undefined,
+      });
+
       // Authentication check
       if (!requireAuthIfEnabled(request, reply)) {
+        console.log('[POST /messages] Auth check failed');
         return;
       }
 
+      // Rate limit check
       if (!enforceRateLimitIfEnabled(request, reply, {
         routeKey: 'messages',
         maxRequests: env.RATE_LIMIT_MESSAGES_PER_WINDOW,
       })) {
+        console.log('[POST /messages] Rate limit exceeded');
         return;
       }
 
       const { chatId } = request.params;
+      const rawBody = request.body as Record<string, unknown> | undefined;
+
+      // Log incoming request for debugging
+      console.log('[POST /messages] Request:', { chatId, role: rawBody?.role, content: rawBody?.content });
+
       let body;
       try {
-        body = CreateMessageSchema.parse(request.body);
+        body = CreateMessageSchema.parse(rawBody);
       } catch (error) {
+        // Log validation error for debugging
+        console.error('[POST /messages] Validation error:', { error, rawBody });
+
         if (error instanceof z.ZodError) {
           return reply.code(400).send({ error: 'Invalid request body', details: error.errors });
         }
@@ -73,6 +84,7 @@ export async function messageRoutes(server: FastifyInstance) {
         return reply.code(404).send({ error: 'Chat not found' });
       }
 
+      // Create and return the message
       const message = await prisma.message.create({
         data: {
           chatId,
@@ -88,151 +100,85 @@ export async function messageRoutes(server: FastifyInstance) {
       });
 
       return reply.code(201).send({ message });
-    }
+    },
+  );
+
+  // GET /v1/chats/:chatId/messages - Get all messages for a chat
+  server.get<{ Params: { chatId: string } }>(
+    '/chats/:chatId/messages',
+    async (request, reply) => {
+      const { chatId } = request.params;
+
+      const messages = await prisma.message.findMany({
+        where: { chatId },
+        orderBy: { createdAt: 'asc' },
+      });
+
+      return { messages };
+    },
   );
 
   // PUT /v1/messages/:id - Update an existing message
-  server.put<{ Params: { id: string } }>(
+  server.put<{ Params: { id: string }; Body: { content: string } }>(
     '/messages/:id',
     async (request, reply) => {
-      if (!requireAuthIfEnabled(request, reply)) {
-        return;
-      }
-
-      if (!enforceRateLimitIfEnabled(request, reply, {
-        routeKey: 'messages',
-        maxRequests: env.RATE_LIMIT_MESSAGES_PER_WINDOW,
-      })) {
-        return;
-      }
-
-      const { id } = request.params;
-      const body = UpdateMessageSchema.parse(request.body);
-
-      const existingMessage = await prisma.message.findUnique({
-        where: { id },
-        select: { id: true, chatId: true },
+      const message = await prisma.message.findUnique({
+        where: { id: request.params.id },
       });
 
-      if (!existingMessage) {
+      if (!message) {
         return reply.code(404).send({ error: 'Message not found' });
       }
 
-      const updatedAt = new Date();
-      const [message] = await prisma.$transaction([
-        prisma.message.update({
-          where: { id },
-          data: {
-            content: body.content,
-          },
-        }),
-        prisma.chat.update({
-          where: { id: existingMessage.chatId },
-          data: { updatedAt },
-        }),
-      ]);
+      const updated = await prisma.message.update({
+        where: { id: request.params.id },
+        data: {
+          content: request.body.content,
+        },
+      });
 
-      return { message };
-    }
+      return reply.code(200).send({ message: updated });
+    },
   );
 
-  // DELETE /v1/messages/:id - Delete a single message
+  // DELETE /v1/messages/:id - Delete a message
   server.delete<{ Params: { id: string } }>(
     '/messages/:id',
     async (request, reply) => {
-      if (!requireAuthIfEnabled(request, reply)) {
-        return;
-      }
-
-      if (!enforceRateLimitIfEnabled(request, reply, {
-        routeKey: 'messages',
-        maxRequests: env.RATE_LIMIT_MESSAGES_PER_WINDOW,
-      })) {
-        return;
-      }
-
       const { id } = request.params;
 
-      const existingMessage = await prisma.message.findUnique({
+      await prisma.message.delete({
         where: { id },
-        select: { id: true, chatId: true },
       });
 
-      if (!existingMessage) {
-        return reply.code(404).send({ error: 'Message not found' });
-      }
-
-      const updatedAt = new Date();
-      await prisma.$transaction([
-        prisma.message.delete({
-          where: { id },
-        }),
-        prisma.chat.update({
-          where: { id: existingMessage.chatId },
-          data: { updatedAt },
-        }),
-      ]);
-
-      return { ok: true };
-    }
+      return reply.code(204).send();
+    },
   );
 
-  // DELETE /v1/chats/:chatId/messages/after/:messageId - Delete this message and all subsequent messages
+  // DELETE /v1/chats/:chatId/messages/after/:messageId - Delete all messages after a specific message
   server.delete<{ Params: { chatId: string; messageId: string } }>(
     '/chats/:chatId/messages/after/:messageId',
     async (request, reply) => {
-      if (!requireAuthIfEnabled(request, reply)) {
-        return;
-      }
-
-      if (!enforceRateLimitIfEnabled(request, reply, {
-        routeKey: 'messages',
-        maxRequests: env.RATE_LIMIT_MESSAGES_PER_WINDOW,
-      })) {
-        return;
-      }
-
       const { chatId, messageId } = request.params;
 
-      const target = await prisma.message.findUnique({
+      // Find the message to delete after
+      const message = await prisma.message.findUnique({
         where: { id: messageId },
-        select: { id: true, chatId: true },
       });
 
-      if (!target || target.chatId !== chatId) {
-        return reply.code(404).send({ error: 'Message not found in chat' });
+      if (!message || message.chatId !== chatId) {
+        return reply.code(404).send({ error: 'Message not found' });
       }
 
-      const orderedMessages = await prisma.message.findMany({
-        where: { chatId },
-        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-        select: { id: true },
+      // Delete all messages after this one
+      const deleted = await prisma.message.deleteMany({
+        where: {
+          chatId,
+          createdAt: { gt: message.createdAt },
+        },
       });
 
-      const startIndex = orderedMessages.findIndex((m: { id: string }) => m.id === messageId);
-      if (startIndex < 0) {
-        return reply.code(404).send({ error: 'Message not found in chat' });
-      }
-
-      const idsToDelete = orderedMessages
-        .slice(startIndex)
-        .map((m: { id: string }) => m.id);
-      const updatedAt = new Date();
-
-      const [deleteResult] = await prisma.$transaction([
-        prisma.message.deleteMany({
-          where: { id: { in: idsToDelete } },
-        }),
-        prisma.chat.update({
-          where: { id: chatId },
-          data: { updatedAt },
-        }),
-      ]);
-
-      return {
-        ok: true,
-        deleted: deleteResult.count,
-      };
-    }
+      return { deleted: deleted.count };
+    },
   );
 }

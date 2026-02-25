@@ -96,6 +96,7 @@ export class DeepSeekOrchestrator {
 
         // Add assistant message with tool_calls FIRST (required by DeepSeek)
         conversation.push({
+          type: 'message',
           role: 'assistant' as const,
           content: lastResponse,
           tool_calls: toolCalls.map((tc: any) => ({
@@ -110,6 +111,7 @@ export class DeepSeekOrchestrator {
           const tc = toolCalls[i];
           const res = execResults[i];
           conversation.push({
+            type: 'message',
             role: 'tool' as const,
             tool_call_id: tc.id || `call_${i}`,
             name: tc.tool,
@@ -121,6 +123,7 @@ export class DeepSeekOrchestrator {
 
         // Ask DeepSeek to synthesize
         conversation.push({
+          type: 'message',
           role: 'user' as const,
           content: 'Based on the tool results above, provide your final answer to the user.',
         });
@@ -144,8 +147,8 @@ export class DeepSeekOrchestrator {
     // For now, just use system prompt + current message to avoid tool_call_id issues
     // TODO: Properly handle conversation history with tool messages
     const messages: ProviderMessage[] = [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: userInput },
+      { type: 'message', role: 'system', content: SYSTEM_PROMPT },
+      { type: 'message', role: 'user', content: userInput },
     ];
 
     return messages;

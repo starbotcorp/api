@@ -26,7 +26,9 @@ export class DeepSeekProvider implements Provider {
       body: JSON.stringify({
         model: options.model || 'deepseek-chat',
         messages: messages.map(m => {
-          const base: any = { role: m.role, content: m.content };
+          // Ensure content is always a string
+          const content = typeof m.content === 'string' ? m.content : String(m.content || '');
+          const base: any = { type: 'message', role: m.role, content };
           // Include tool_call_id and name for tool messages (required by DeepSeek)
           if (m.role === 'tool') {
             base.tool_call_id = m.tool_call_id;
@@ -34,7 +36,14 @@ export class DeepSeekProvider implements Provider {
           }
           // Include tool_calls for assistant messages with tools
           if (m.role === 'assistant' && m.tool_calls) {
-            base.tool_calls = m.tool_calls;
+            base.tool_calls = m.tool_calls.map(tc => ({
+              id: tc.id,
+              type: 'function',
+              function: {
+                name: tc.name,
+                arguments: tc.arguments,
+              },
+            }));
           }
           return base;
         }),
@@ -74,7 +83,9 @@ export class DeepSeekProvider implements Provider {
       body: JSON.stringify({
         model: options.model || 'deepseek-chat',
         messages: messages.map(m => {
-          const base: any = { role: m.role, content: m.content };
+          // Ensure content is always a string
+          const content = typeof m.content === 'string' ? m.content : String(m.content || '');
+          const base: any = { type: 'message', role: m.role, content };
           // Include tool_call_id and name for tool messages (required by DeepSeek)
           if (m.role === 'tool') {
             base.tool_call_id = m.tool_call_id;
@@ -82,7 +93,14 @@ export class DeepSeekProvider implements Provider {
           }
           // Include tool_calls for assistant messages with tools
           if (m.role === 'assistant' && m.tool_calls) {
-            base.tool_calls = m.tool_calls;
+            base.tool_calls = m.tool_calls.map(tc => ({
+              id: tc.id,
+              type: 'function',
+              function: {
+                name: tc.name,
+                arguments: tc.arguments,
+              },
+            }));
           }
           return base;
         }),

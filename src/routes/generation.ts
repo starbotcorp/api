@@ -685,6 +685,7 @@ export async function generationRoutes(server: FastifyInstance) {
       // Inject Codex header as system message so downstream model sees routing metadata
       if (codexHeader) {
         providerMessages.push({
+          type: 'message',
           role: 'system',
           content: serializeHeader(codexHeader) + '\nThe above header classifies this request. Use it to guide your response style, depth, and tool usage.',
         });
@@ -692,6 +693,7 @@ export async function generationRoutes(server: FastifyInstance) {
 
       if (identityContext) {
         providerMessages.push({
+          type: 'message',
           role: 'system',
           content: identityContext,
         });
@@ -699,6 +701,7 @@ export async function generationRoutes(server: FastifyInstance) {
 
       if (chatMemoryContext) {
         providerMessages.push({
+          type: 'message',
           role: 'system',
           content: chatMemoryContext,
         });
@@ -706,6 +709,7 @@ export async function generationRoutes(server: FastifyInstance) {
 
       if (webSearchContext) {
         providerMessages.push({
+          type: 'message',
           role: 'system',
           content: webSearchContext,
         });
@@ -713,6 +717,7 @@ export async function generationRoutes(server: FastifyInstance) {
 
       if (memoryContext) {
         providerMessages.push({
+          type: 'message',
           role: 'system',
           content: memoryContext,
         });
@@ -720,6 +725,7 @@ export async function generationRoutes(server: FastifyInstance) {
 
       if (taskContext) {
         providerMessages.push({
+          type: 'message',
           role: 'system',
           content: taskContext,
         });
@@ -730,11 +736,13 @@ export async function generationRoutes(server: FastifyInstance) {
         ...chat.messages.map((m: { role: string; content: string }, idx: number) => {
           if (m.role === 'tool') {
             return {
+              type: 'message' as const,
               role: 'assistant' as const,
               content: `[Tool Result]\n${m.content}`,
             };
           }
           return {
+            type: 'message' as const,
             role: m.role as 'user' | 'assistant' | 'system',
             content: idx === lastUserIndex ? interpretedUserMessage : m.content,
           };
@@ -788,6 +796,12 @@ export async function generationRoutes(server: FastifyInstance) {
           sendEvent('token.delta', { text: char });
           fullResponse += char;
         }
+        sendEvent('message.final', {
+          id: `msg-${Date.now()}`,
+          role: 'assistant',
+          content: fullResponse,
+          usage: { promptTokens: 0, completionTokens: fullResponse.length, totalTokens: fullResponse.length },
+        });
         sendEvent('message.stop', {});
 
         // Send tool results as metadata
@@ -923,6 +937,7 @@ export async function generationRoutes(server: FastifyInstance) {
             if (finishReason === 'tool_calls' && toolCalls.length > 0) {
               // Add assistant message with tool calls to conversation
               providerMessages.push({
+                type: 'message',
                 role: 'assistant',
                 content: fullResponse || '',
                 tool_calls: toolCalls,
@@ -957,6 +972,7 @@ export async function generationRoutes(server: FastifyInstance) {
                   const errorResult = JSON.stringify({ error: 'Tool not found' });
 
                   providerMessages.push({
+                    type: 'message',
                     role: 'tool',
                     tool_call_id: toolCall.id,
                     name: toolCall.name,
@@ -980,6 +996,7 @@ export async function generationRoutes(server: FastifyInstance) {
 
                   // Add tool result to provider messages
                   providerMessages.push({
+                    type: 'message',
                     role: 'tool',
                     tool_call_id: toolCall.id,
                     name: toolCall.name,
@@ -997,6 +1014,7 @@ export async function generationRoutes(server: FastifyInstance) {
                   const errorMessage = error instanceof Error ? error.message : String(error);
 
                   providerMessages.push({
+                    type: 'message',
                     role: 'tool',
                     tool_call_id: toolCall.id,
                     name: toolCall.name,
