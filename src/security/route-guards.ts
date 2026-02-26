@@ -59,6 +59,54 @@ export function requireAuthIfEnabled(request: FastifyRequest, reply: FastifyRepl
   return false;
 }
 
+// Fix #5: Get real client IP considering trusted proxies
+const TRUSTED_PROXY_RANGES = [
+  // Private IP ranges (RFC 1918)
+  /^10\./,
+  /^172\.(1[6-9]|2[0-9]|3[0-1])\./,
+  /^192\.168\./,
+  // Localhost
+  /^127\./,
+  /^::1$/,
+];
+
+function isTrustedProxy(ip: string): boolean {
+  return TRUSTED_PROXY_RANGES.some(range => range.test(ip));
+}
+
+function getRealClientIP(request: FastifyRequest): string {
+  // If request is from a trusted proxy, check X-Forwarded-For
+  const clientIP = request.ip;
+
+  if (isTrustedProxy(clientIP)) {
+    const forwarded = request.headers['x-forwarded-for'];
+    if (forwarded && typeof forwarded === 'string') {
+      // X-Forwarded-For format: client, proxy1, proxy2, ...
+      // The rightmost untrusted IP is the real client
+      const ips = forwarded.split(',').map(ip => ip.trim());
+
+      // Walk from right to left, find first non-trusted IP
+      for (let i = ips.length - 1; i >= 0; i--) {
+        const ip = ips[i];
+        if (ip && !isTrustedProxy(ip)) {
+          return ip;
+        }
+      }
+
+      // All IPs are trusted, use the leftmost
+      return ips[0] || clientIP;
+    }
+
+    // Also check X-Real-IP header (used by nginx)
+    const realIP = request.headers['x-real-ip'];
+    if (realIP && typeof realIP === 'string') {
+      return realIP;
+    }
+  }
+
+  return clientIP;
+}
+
 interface RateLimitOptions {
   routeKey: string;
   maxRequests: number;
@@ -75,9 +123,11 @@ export function enforceRateLimitIfEnabled(
   cleanupExpiredBuckets(now);
 
   const token = extractAuthToken(request);
+
+  // Fix #5: Use real client IP instead of request.ip
   const clientKey = token
     ? `token:${stableTokenHash(token)}`
-    : `ip:${request.ip || 'unknown'}`;
+    : `ip:${getRealClientIP(request)}`;
   const bucketKey = `${options.routeKey}:${clientKey}`;
 
   const current = rateBuckets.get(bucketKey);
@@ -104,3 +154,6 @@ export function enforceRateLimitIfEnabled(
   rateBuckets.set(bucketKey, current);
   return true;
 }
+
+// Export for testing
+export { getRealClientIP, isTrustedProxy };

@@ -6,31 +6,62 @@ const TOOL_NAME = 'shell_exec';
 
 const description = `Execute shell commands in the terminal. Use this to run build commands, tests, git operations, npm/yarn/pnpm commands, or any other command-line operations. Returns stdout, stderr, and exit code.`;
 
-// Blocked commands for security
-const BLOCKED_COMMANDS = [
-  'rm -rf /',
-  'rm -rf /*',
-  'mkfs',
-  'dd if=',
-  ':(){:|:&};:', // Fork bomb
-  'chmod 777 /',
-  'chown -R',
-  '> /dev/sda',
-  'wget | sh',
-  'curl | sh',
+// Fix #3: Switch from blocklist to allowlist approach
+const ALLOWED_COMMANDS = [
+  /^npm\s+(install|run|test|build|lint|ci|update|outdated|audit)/,
+  /^pnpm\s+(install|run|test|build|lint|ci|update|outdated|audit)/,
+  /^yarn\s+(install|run|test|build|lint|upgrade|outdated)/,
+  /^bun\s+(install|run|test|build|lint)/,
+  /^git\s+(status|log|diff|branch|clone|pull|push|add|commit|checkout|merge|rebase|stash|fetch|tag|remote|init|restore|switch)/,
+  /^node\s+[\w\-\.\/]+\.js$/,
+  /^node\s+--/,
+  /^python3?\s+[\w\-\.\/]+\.py$/,
+  /^python3?\s+-m\s+[\w\.]+/,
+  /^pip3?\s+(install|list|show|freeze|uninstall)/,
+  /^cargo\s+(build|run|test|check|clippy|fmt|doc|clean|update)/,
+  /^rustc\s+[\w\-\.\/]+\.rs$/,
+  /^go\s+(build|run|test|mod|fmt|vet|doc|clean)/,
+  /^make\s*$/,
+  /^make\s+[\w\-]+$/,
+  /^ls(\s+-[la]+)?$/,
+  /^cat\s+[\w\-\.\/]+$/,
+  /^echo\s+.+$/,
+  /^mkdir\s+-p\s+[\w\-\.\/]+$/,
+  /^touch\s+[\w\-\.\/]+$/,
+  /^pwd$/,
+  /^which\s+[\w\-\.\/]+$/,
+  /^type\s+[\w\-\.\/]+$/,
+  /^head\s+-n\s+\d+\s+[\w\-\.\/]+$/,
+  /^tail\s+-n\s+\d+\s+[\w\-\.\/]+$/,
+  /^wc(\s+-[lw]+)?\s+[\w\-\.\/]+$/,
+  /^find\s+[\w\-\.\/]+\s+-name\s+.+$/,
+  /^grep(\s+-[rinvE]+)?\s+.+\s+[\w\-\.\/]+$/,
+  /^sed\s+-i?\s*['"].+['"]\s+[\w\-\.\/]+$/,
+  /^awk\s+['"].+['"]\s+[\w\-\.\/]+$/,
+  /^env$/,
+  /^printenv\s*[\w]*$/,
+  /^date$/,
+  /^uname(\s+-a)?$/,
+  /^curl\s+-[sS]\s+[\w\-\.\/:]+$/,
+  /^tar\s+-[cxz][vf]+\s+[\w\-\.\/]+$/,
+  /^unzip\s+[\w\-\.\/]+$/,
 ];
 
-// Commands that require confirmation or are high-risk
-const WARN_COMMANDS = [
-  'rm -rf',
-  'rm -r',
-  'del ',
-  'format',
-  'shutdown',
-  'reboot',
-  'halt',
-  'init 0',
-  'init 6',
+// Dangerous patterns that should never be allowed
+const DANGEROUS_PATTERNS = [
+  /[;&|`$()]/,           // Command chaining/injection
+  /\.\./,                // Path traversal
+  /[<>]/,                // Redirection
+  /~|\$HOME|\$USER|\$PATH/, // Environment expansion
+  /\\x[0-9a-fA-F]{2}/,   // Hex encoding
+  /\\u[0-9a-fA-F]{4}/,   // Unicode encoding
+  /\$\(/,                // Command substitution
+  /\$\{/,                // Variable expansion
+  /`/,                   // Backtick command substitution
+  /\|\s*\w+/,            // Piping to other commands
+  /&&/,                  // AND operator
+  /\|\|/,                // OR operator
+  /;/,                   // Command separator
 ];
 
 interface ShellExecArgs {
@@ -39,14 +70,24 @@ interface ShellExecArgs {
   cwd?: string;
 }
 
-function isCommandBlocked(command: string): boolean {
-  const lower = command.toLowerCase().trim();
-  return BLOCKED_COMMANDS.some(blocked => lower.includes(blocked));
-}
+function isCommandAllowed(command: string): { allowed: boolean; reason?: string } {
+  const trimmed = command.trim();
 
-function isCommandWarnable(command: string): boolean {
-  const lower = command.toLowerCase().trim();
-  return WARN_COMMANDS.some(warn => lower.startsWith(warn) || lower.includes(` ${warn}`));
+  // Check for dangerous patterns first
+  for (const pattern of DANGEROUS_PATTERNS) {
+    if (pattern.test(trimmed)) {
+      return { allowed: false, reason: `Dangerous pattern detected: ${pattern.source}` };
+    }
+  }
+
+  // Check against allowlist
+  for (const pattern of ALLOWED_COMMANDS) {
+    if (pattern.test(trimmed)) {
+      return { allowed: true };
+    }
+  }
+
+  return { allowed: false, reason: 'Command not in allowlist' };
 }
 
 export const shellExecTool: ToolDefinition = {
@@ -80,19 +121,19 @@ export const shellExecTool: ToolDefinition = {
     // Validate timeout
     const safeTimeout = Math.min(Math.max(1, timeout), 120);
 
-    // Security check
-    if (isCommandBlocked(command)) {
+    // Fix #3: Use allowlist instead of blocklist
+    const commandCheck = isCommandAllowed(command);
+    if (!commandCheck.allowed) {
       return {
         success: false,
         content: JSON.stringify({
-          error: 'Command blocked for security reasons',
-          blocked: true,
+          error: 'Command not allowed for security reasons',
+          reason: commandCheck.reason,
+          command,
+          hint: 'Only standard development commands (npm, git, build tools) are allowed. Contact admin if you need additional commands.',
         }),
       };
     }
-
-    // Warn about dangerous commands but still execute
-    const isWarnable = isCommandWarnable(command);
 
     // Determine working directory
     const workspaceRoot = process.env.WORKSPACE_ROOT || process.cwd();
@@ -100,8 +141,17 @@ export const shellExecTool: ToolDefinition = {
 
     if (cwd) {
       const resolvedCwd = path.resolve(workspaceRoot, cwd);
+      // Prevent path traversal
       if (resolvedCwd.startsWith(workspaceRoot)) {
         workingDir = resolvedCwd;
+      } else {
+        return {
+          success: false,
+          content: JSON.stringify({
+            error: 'Working directory outside workspace',
+            cwd,
+          }),
+        };
       }
     }
 
@@ -161,7 +211,6 @@ export const shellExecTool: ToolDefinition = {
           stdout: stdout.trim(),
           stderr: stderr.trim(),
           killed,
-          warning: isWarnable ? 'Command may be destructive - executed with caution' : undefined,
         };
 
         resolve({

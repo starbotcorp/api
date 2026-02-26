@@ -164,6 +164,49 @@ async function resolveRequestedModel(
   return getBestModelForTier(tier, capability, true);
 }
 
+// Fix #2: Path traversal validation helper
+async function validatePathWithinWorkspace(
+  workspacePath: string,
+  requestedPath: string
+): Promise<{ valid: boolean; resolvedPath?: string; error?: string }> {
+  const resolvedWorkspace = path.resolve(workspacePath);
+  const resolvedPath = path.resolve(workspacePath, requestedPath);
+
+  // Check if resolved path is within workspace
+  if (!resolvedPath.startsWith(resolvedWorkspace)) {
+    return { valid: false, error: 'Access denied: path outside workspace' };
+  }
+
+  // Check for symlinks that escape the workspace
+  try {
+    const realPath = await fs.realpath(resolvedPath);
+    if (!realPath.startsWith(resolvedWorkspace)) {
+      return { valid: false, error: 'Access denied: symlink outside workspace' };
+    }
+    return { valid: true, resolvedPath: realPath };
+  } catch {
+    // Path doesn't exist yet (for writes) - use resolved path
+    return { valid: true, resolvedPath };
+  }
+}
+
+// Fix #13: Workspace validation helper
+async function validateWorkspace(workspaceId: string): Promise<{ valid: boolean; workspace?: any; error?: string }> {
+  try {
+    const workspace = await prisma.workspace.findUnique({
+      where: { id: workspaceId },
+    });
+
+    if (!workspace) {
+      return { valid: false, error: 'Workspace not found' };
+    }
+
+    return { valid: true, workspace };
+  } catch (err) {
+    return { valid: false, error: 'Failed to validate workspace' };
+  }
+}
+
 export async function generationRoutes(server: FastifyInstance) {
   // GET /v1/files/list - List files in directory
   server.get('/files/list', async (request, reply) => {
@@ -174,15 +217,23 @@ export async function generationRoutes(server: FastifyInstance) {
     const { workspace_id, path: dirPath } = FileListSchema.parse(request.query);
 
     try {
-      // Use the provided path directly. In production, you'd map workspace_id to actual paths
-      let fullPath;
-      if (dirPath.startsWith('/')) {
-        fullPath = dirPath;
-      } else {
-        // For relative paths, use a default workspace directory
-        const workspacePath = `/workspace/${workspace_id}`;
-        fullPath = path.join(workspacePath, dirPath);
+      // Fix #13: Validate workspace exists
+      const workspaceValidation = await validateWorkspace(workspace_id);
+      if (!workspaceValidation.valid) {
+        return reply.code(404).send({ error: workspaceValidation.error });
       }
+
+      // Use workspace identifier for the actual path
+      const workspace = workspaceValidation.workspace;
+      const workspacePath = workspace.identifier || `/workspace/${workspace_id}`;
+
+      // Fix #2: Validate path is within workspace
+      const pathValidation = await validatePathWithinWorkspace(workspacePath, dirPath);
+      if (!pathValidation.valid) {
+        return reply.code(403).send({ error: pathValidation.error });
+      }
+
+      const fullPath = pathValidation.resolvedPath!;
       const items = await fs.readdir(fullPath, { withFileTypes: true });
 
       const files = await Promise.all(items.map(async (item) => {
@@ -227,8 +278,22 @@ export async function generationRoutes(server: FastifyInstance) {
     const { workspace_id, path: filePath } = FileReadSchema.parse(request.query);
 
     try {
-      const workspacePath = `/workspace/${workspace_id}`;
-      const fullPath = path.join(workspacePath, filePath);
+      // Fix #13: Validate workspace exists
+      const workspaceValidation = await validateWorkspace(workspace_id);
+      if (!workspaceValidation.valid) {
+        return reply.code(404).send({ error: workspaceValidation.error });
+      }
+
+      const workspace = workspaceValidation.workspace;
+      const workspacePath = workspace.identifier || `/workspace/${workspace_id}`;
+
+      // Fix #2: Validate path is within workspace
+      const pathValidation = await validatePathWithinWorkspace(workspacePath, filePath);
+      if (!pathValidation.valid) {
+        return reply.code(403).send({ error: pathValidation.error });
+      }
+
+      const fullPath = pathValidation.resolvedPath!;
 
       const content = await fs.readFile(fullPath, 'utf-8');
       const stats = await fs.stat(fullPath);
@@ -296,8 +361,22 @@ export async function generationRoutes(server: FastifyInstance) {
     const { workspace_id, file_path, content, create_backup } = FileWriteSchema.parse(request.body);
 
     try {
-      const workspacePath = `/workspace/${workspace_id}`;
-      const fullPath = path.join(workspacePath, file_path);
+      // Fix #13: Validate workspace exists
+      const workspaceValidation = await validateWorkspace(workspace_id);
+      if (!workspaceValidation.valid) {
+        return reply.code(404).send({ error: workspaceValidation.error });
+      }
+
+      const workspace = workspaceValidation.workspace;
+      const workspacePath = workspace.identifier || `/workspace/${workspace_id}`;
+
+      // Fix #2: Validate path is within workspace
+      const pathValidation = await validatePathWithinWorkspace(workspacePath, file_path);
+      if (!pathValidation.valid) {
+        return reply.code(403).send({ error: pathValidation.error });
+      }
+
+      const fullPath = pathValidation.resolvedPath!;
 
       // Create backup if requested and file exists
       let backupPath: string | undefined;
@@ -365,6 +444,12 @@ export async function generationRoutes(server: FastifyInstance) {
 
     const body = RunChatSchema.parse(request.body);
 
+    // Track request lifecycle for debugging
+    const requestId = crypto.randomUUID();
+    server.log.info({ requestId, chatId }, 'Generation request started');
+
+    server.log.info({ requestId, chatId }, 'Fetching chat from database');
+
     // Verify chat exists
     const chat = await prisma.chat.findUnique({
       where: { id: chatId },
@@ -391,14 +476,31 @@ export async function generationRoutes(server: FastifyInstance) {
     reply.raw.setHeader('Cache-Control', 'no-cache');
     reply.raw.setHeader('Connection', 'keep-alive');
 
+    // Cleanup handler for resources
+    let isStreamActive = true;
+    const cleanup = () => {
+      if (isStreamActive) {
+        isStreamActive = false;
+        server.log.info({ requestId, chatId }, 'Generation request completed/cleaned up');
+      }
+    };
+
+    // Ensure cleanup on client disconnect
+    reply.raw.on('close', cleanup);
+    reply.raw.on('error', cleanup);
+
     // Helper to send SSE events
     const sendEvent = (type: string, data: any) => {
+      if (!isStreamActive) {
+        return; // Don't send if stream is closed
+      }
       try {
         const dataStr = typeof data === 'string' ? data : JSON.stringify(data);
         reply.raw.write(`event: ${type}\n`);
         reply.raw.write(`data: ${dataStr}\n\n`);
       } catch (e) {
-        server.log.error({ err: e, type, data }, 'Failed to send SSE event');
+        server.log.error({ err: e, requestId, type, data }, 'Failed to send SSE event');
+        cleanup();
       }
     };
 
@@ -599,6 +701,7 @@ export async function generationRoutes(server: FastifyInstance) {
 
       // --- Selective memory retrieval ---
       sendEvent('status', { message: 'Retrieving relevant memory...' });
+      server.log.info({ requestId, chatId }, 'Starting memory retrieval (may acquire DB connection)');
 
       let memoryContext = '';
       let identityContext = '';
@@ -638,8 +741,10 @@ export async function generationRoutes(server: FastifyInstance) {
           );
         }
       } catch (err) {
-        server.log.warn({ err }, 'Memory retrieval failed');
+        server.log.warn({ err, requestId, chatId }, 'Memory retrieval failed');
       }
+
+      server.log.info({ requestId, chatId }, 'Memory retrieval completed, releasing DB connection');
 
       sendEvent('memory.injected', {
         identity_chunks: identityContext ? 1 : 0,
@@ -947,12 +1052,30 @@ export async function generationRoutes(server: FastifyInstance) {
               for (const toolCall of toolCalls) {
                 const toolStartTime = Date.now();
 
-                // Parse and log tool arguments
-                let parsedArgs: any = {};
+                // Fix #10: Proper JSON parsing with error handling
+                let parsedArgs: Record<string, unknown>;
                 try {
                   parsedArgs = JSON.parse(toolCall.arguments);
                 } catch (e) {
-                  // Leave as empty object if parsing fails
+                  // Reject invalid tool calls instead of silently defaulting
+                  sendEvent('tool.error', {
+                    tool_call_id: toolCall.id,
+                    tool_name: toolCall.name,
+                    error: 'Invalid JSON in tool arguments',
+                    raw_arguments: toolCall.arguments,
+                  });
+
+                  providerMessages.push({
+                    type: 'message',
+                    role: 'tool',
+                    tool_call_id: toolCall.id,
+                    name: toolCall.name,
+                    content: JSON.stringify({
+                      error: 'Failed to parse tool arguments as JSON',
+                      raw_arguments: toolCall.arguments,
+                    }),
+                  });
+                  continue;
                 }
 
                 sendEvent('tool.arguments', {
@@ -989,9 +1112,34 @@ export async function generationRoutes(server: FastifyInstance) {
                   continue;
                 }
 
+                // Fix #10: Validate required parameters
+                const missingParams = tool.parameters
+                  .filter(p => p.required && !(p.name in parsedArgs))
+                  .map(p => p.name);
+
+                if (missingParams.length > 0) {
+                  sendEvent('tool.error', {
+                    tool_call_id: toolCall.id,
+                    tool_name: toolCall.name,
+                    error: `Missing required parameters: ${missingParams.join(', ')}`,
+                  });
+
+                  providerMessages.push({
+                    type: 'message',
+                    role: 'tool',
+                    tool_call_id: toolCall.id,
+                    name: toolCall.name,
+                    content: JSON.stringify({
+                      error: `Missing required parameters: ${missingParams.join(', ')}`,
+                      required: tool.parameters.filter(p => p.required).map(p => p.name),
+                      provided: Object.keys(parsedArgs),
+                    }),
+                  });
+                  continue;
+                }
+
                 try {
-                  const args = JSON.parse(toolCall.arguments);
-                  const result = await tool.execute(args);
+                  const result = await tool.execute(parsedArgs);
                   const toolDurationMs = Date.now() - toolStartTime;
 
                   // Add tool result to provider messages
@@ -1161,13 +1309,15 @@ export async function generationRoutes(server: FastifyInstance) {
       });
 
       reply.raw.end();
+      cleanup();
     } catch (err) {
-      server.log.error(err);
+      server.log.error({ err, requestId, chatId }, 'Generation request error');
       sendEvent('error', {
         message: err instanceof Error ? err.message : 'Unknown error',
         fatal: true,
       });
       reply.raw.end();
+      cleanup();
     }
   });
 

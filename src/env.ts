@@ -3,11 +3,33 @@
 
 const strEnv = (value: string | undefined, fallback = '') => (value ?? fallback).trim();
 
+// Fix #9: Validate numeric environment variables
+function parsePort(value: string | undefined, defaultPort: number): number {
+  if (!value) return defaultPort;
+  const parsed = parseInt(value, 10);
+  if (isNaN(parsed) || parsed < 1 || parsed > 65535) {
+    console.error(`Invalid PORT "${value}", using default ${defaultPort}`);
+    return defaultPort;
+  }
+  return parsed;
+}
+
+function parsePositiveInt(value: string | undefined, defaultValue: number, name: string): number {
+  if (!value) return defaultValue;
+  const parsed = parseInt(value, 10);
+  if (isNaN(parsed) || parsed < 0) {
+    console.error(`Invalid ${name} "${value}", using default ${defaultValue}`);
+    return defaultValue;
+  }
+  return parsed;
+}
+
 export const env = {
   // Server
-  PORT: parseInt(process.env.PORT || '3737', 10),
+  PORT: parsePort(process.env.PORT, 3737),
   HOST: process.env.HOST || '127.0.0.1',
   NODE_ENV: process.env.NODE_ENV || 'development',
+  DATABASE_URL: process.env.DATABASE_URL || 'file:./prisma/dev.db',
 
   // Kimi/Moonshot
   MOONSHOT_API_KEY: strEnv(process.env.MOONSHOT_API_KEY),
@@ -48,12 +70,12 @@ export const env = {
     process.env.INTERPRETER_MODEL,
     '@cf/mistralai/mistral-small-3.1-24b-instruct',
   ),
-  INTERPRETER_MAX_TOKENS: parseInt(process.env.INTERPRETER_MAX_TOKENS || '220', 10),
+  INTERPRETER_MAX_TOKENS: parsePositiveInt(process.env.INTERPRETER_MAX_TOKENS, 220, 'INTERPRETER_MAX_TOKENS'),
 
   // Codex Router (DISABLED - using DeepSeek directly)
   CODEX_ROUTER_ENABLED: false,
   CODEX_ROUTER_MODEL: strEnv(process.env.CODEX_ROUTER_MODEL, 'DeepSeek-R1'),
-  CODEX_ROUTER_MAX_TOKENS: parseInt(process.env.CODEX_ROUTER_MAX_TOKENS || '300', 10),
+  CODEX_ROUTER_MAX_TOKENS: parsePositiveInt(process.env.CODEX_ROUTER_MAX_TOKENS, 300, 'CODEX_ROUTER_MAX_TOKENS'),
 
   // Triage
   TRIAGE_MODEL_ENABLED: process.env.TRIAGE_MODEL_ENABLED === 'true',
@@ -69,13 +91,14 @@ export const env = {
   MEMORY_V2_ENABLED: process.env.MEMORY_V2_ENABLED === 'true',
   AUTH_ENFORCEMENT_ENABLED: process.env.AUTH_ENFORCEMENT_ENABLED === 'true',
   RATE_LIMITING_ENABLED: process.env.RATE_LIMITING_ENABLED === 'true',
-  RATE_LIMIT_WINDOW_MS: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10),
-  RATE_LIMIT_RUN_PER_WINDOW: parseInt(process.env.RATE_LIMIT_RUN_PER_WINDOW || '8', 10),
-  RATE_LIMIT_MESSAGES_PER_WINDOW: parseInt(process.env.RATE_LIMIT_MESSAGES_PER_WINDOW || '100', 10),
-  RATE_LIMIT_INFERENCE_PER_WINDOW: parseInt(process.env.RATE_LIMIT_INFERENCE_PER_WINDOW || '30', 10),
-  RATE_LIMIT_COMPLETION_PER_WINDOW: parseInt(
-    process.env.RATE_LIMIT_COMPLETION_PER_WINDOW || '60',
-    10,
+  RATE_LIMIT_WINDOW_MS: parsePositiveInt(process.env.RATE_LIMIT_WINDOW_MS, 60000, 'RATE_LIMIT_WINDOW_MS'),
+  RATE_LIMIT_RUN_PER_WINDOW: parsePositiveInt(process.env.RATE_LIMIT_RUN_PER_WINDOW, 8, 'RATE_LIMIT_RUN_PER_WINDOW'),
+  RATE_LIMIT_MESSAGES_PER_WINDOW: parsePositiveInt(process.env.RATE_LIMIT_MESSAGES_PER_WINDOW, 100, 'RATE_LIMIT_MESSAGES_PER_WINDOW'),
+  RATE_LIMIT_INFERENCE_PER_WINDOW: parsePositiveInt(process.env.RATE_LIMIT_INFERENCE_PER_WINDOW, 30, 'RATE_LIMIT_INFERENCE_PER_WINDOW'),
+  RATE_LIMIT_COMPLETION_PER_WINDOW: parsePositiveInt(
+    process.env.RATE_LIMIT_COMPLETION_PER_WINDOW,
+    60,
+    'RATE_LIMIT_COMPLETION_PER_WINDOW',
   ),
 
   // Logging

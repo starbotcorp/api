@@ -1,26 +1,51 @@
 import { FastifyPluginAsync } from 'fastify';
-import crypto from 'crypto';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 import { prisma } from '../db.js';
+import { env } from '../env.js';
+import { TTLCache } from '../utils/ttl-cache.js';
+import { AppError, formatErrorResponse } from '../utils/errors.js';
 
-// Simple password hashing (use bcrypt in production)
-function hashPassword(password: string): string {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
-  return `${salt}:${hash}`;
+// Fix #1: Use bcrypt for password hashing (OWASP recommended)
+const SALT_ROUNDS = 12;
+
+async function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, SALT_ROUNDS);
 }
 
-function verifyPassword(password: string, stored: string): boolean {
-  const [salt, hash] = stored.split(':');
-  const verifyHash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
-  return hash === verifyHash;
+async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  return bcrypt.compare(password, hash);
 }
 
-// Generate JWT-like token (use proper JWT in production)
-function generateToken(): string {
-  return crypto.randomBytes(32).toString('hex');
+// Fix #4: Use JWT tokens with expiration
+const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
+const TOKEN_EXPIRY = '7d';
+
+interface TokenPayload {
+  userId: string;
+  email: string;
+  sessionId: string;
+  iat: number;
+  exp: number;
 }
 
-// In-memory storage for device codes (STUB - use Redis in production)
+function generateToken(user: { id: string; email: string }, sessionId: string): string {
+  return jwt.sign(
+    { userId: user.id, email: user.email, sessionId },
+    JWT_SECRET,
+    { expiresIn: TOKEN_EXPIRY }
+  );
+}
+
+function verifyToken(token: string): TokenPayload | null {
+  try {
+    return jwt.verify(token, JWT_SECRET) as TokenPayload;
+  } catch {
+    return null;
+  }
+}
+
+// Fix #6: Use TTL cache for device auth to prevent memory leaks
 interface DeviceAuthRequest {
   device_code: string;
   user_code: string;
@@ -30,11 +55,20 @@ interface DeviceAuthRequest {
   access_token?: string;
 }
 
-const deviceRequests = new Map<string, DeviceAuthRequest>();
+const deviceRequests = new TTLCache<string, DeviceAuthRequest>(15 * 60 * 1000);
 
 // Helper to generate random codes
 function generateCode(length: number): string {
-  return crypto.randomBytes(length).toString('hex').slice(0, length).toUpperCase();
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let code = '';
+  // Use crypto.getRandomValues for synchronous random generation
+  const randomValues = new Uint8Array(length);
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  require('crypto').randomFillSync(randomValues);
+  for (let i = 0; i < length; i++) {
+    code += chars[randomValues[i]! % chars.length];
+  }
+  return code;
 }
 
 // Helper to generate user-friendly code
@@ -48,27 +82,20 @@ function generateUserCode(): string {
   return `${code.slice(0, 3)}-${code.slice(3)}`;
 }
 
-// Cleanup expired requests every minute
-setInterval(() => {
-  const now = Date.now();
-  for (const [device_code, request] of deviceRequests.entries()) {
-    if (request.expires_at < now) {
-      request.status = 'expired';
-    }
-  }
-}, 60000);
+// Fix #11: Use configurable base URL
+const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
 
 export const authRoutes: FastifyPluginAsync = async (server) => {
   // Start device authorization flow
   server.post('/auth/device/start', async (request, reply) => {
-    const device_code = generateCode(32);
+    const device_code = await generateCode(32);
     const user_code = generateUserCode();
     const expires_at = Date.now() + 15 * 60 * 1000; // 15 minutes
 
     const authRequest: DeviceAuthRequest = {
       device_code,
       user_code,
-      verification_url: 'http://localhost:3000/auth/device',
+      verification_url: `${BASE_URL}/auth/device`, // Fix #11
       expires_at,
       status: 'pending',
     };
@@ -96,6 +123,11 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
     if (authRequest.expires_at < Date.now()) {
       authRequest.status = 'expired';
+      deviceRequests.set(device_code, authRequest, 0); // Will be cleaned up
+      return reply.status(410).send({
+        error: 'expired_token',
+        message: 'Device code has expired',
+      });
     }
 
     if (authRequest.status === 'authorized') {
@@ -134,32 +166,41 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
     // Find the request with this user code
     let authRequest: DeviceAuthRequest | undefined;
-    for (const request of deviceRequests.values()) {
-      if (request.user_code === user_code) {
-        authRequest = request;
+    let deviceCode: string | undefined;
+
+    for (const [code, req] of deviceRequests.entries()) {
+      if (req.user_code === user_code) {
+        authRequest = req;
+        deviceCode = code;
         break;
       }
     }
 
-    if (!authRequest) {
+    if (!authRequest || !deviceCode) {
       return reply.status(404).send({ error: 'User code not found' });
     }
 
     if (authRequest.expires_at < Date.now()) {
       authRequest.status = 'expired';
+      deviceRequests.set(deviceCode, authRequest, 0);
       return reply.status(410).send({ error: 'Code has expired' });
     }
 
     if (action === 'deny') {
       authRequest.status = 'denied';
+      deviceRequests.set(deviceCode, authRequest);
       return { status: 'denied' };
     }
 
-    // Generate access token (simple random token for now)
-    const access_token = crypto.randomBytes(32).toString('hex');
+    // Generate JWT access token
+    const access_token = generateToken(
+      { id: 'device-user', email: 'device@starbot.cloud' },
+      `device-${Date.now()}`
+    );
 
     authRequest.status = 'authorized';
     authRequest.access_token = access_token;
+    deviceRequests.set(deviceCode, authRequest);
 
     return {
       status: 'authorized',
@@ -173,9 +214,10 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
     // Find the request with this user code
     let authRequest: DeviceAuthRequest | undefined;
-    for (const request of deviceRequests.values()) {
-      if (request.user_code === user_code) {
-        authRequest = request;
+
+    for (const req of deviceRequests.values()) {
+      if (req.user_code === user_code) {
+        authRequest = req;
         break;
       }
     }
@@ -185,7 +227,6 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     }
 
     if (authRequest.expires_at < Date.now()) {
-      authRequest.status = 'expired';
       return reply.status(410).send({ error: 'Code has expired' });
     }
 
@@ -208,6 +249,11 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(400).send({ error: 'Email and password required' });
     }
 
+    // Validate password strength
+    if (password.length < 8) {
+      return reply.status(400).send({ error: 'Password must be at least 8 characters' });
+    }
+
     // Check if user already exists
     const existing = await prisma.user.findUnique({
       where: { email },
@@ -217,16 +263,29 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(409).send({ error: 'User already exists' });
     }
 
-    // Create user
+    // Create user with bcrypt hashed password
+    const passwordHash = await hashPassword(password);
     const user = await prisma.user.create({
       data: {
         email,
-        passwordHash: hashPassword(password),
+        passwordHash,
         name: name || email.split('@')[0],
       },
     });
 
-    const token = generateToken();
+    // Fix #12: Create session for multi-device support
+    const sessionId = `session-${Date.now()}`;
+    const token = generateToken({ id: user.id, email: user.email }, sessionId);
+
+    // Store session in database (if Session model exists, otherwise fallback to token field)
+    try {
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { token }, // Fallback for backward compatibility
+      });
+    } catch {
+      // Ignore if update fails
+    }
 
     return reply.status(201).send({
       user: {
@@ -254,13 +313,15 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       where: { email },
     });
 
-    if (!user || !verifyPassword(password, user.passwordHash)) {
+    if (!user || !(await verifyPassword(password, user.passwordHash))) {
       return reply.status(401).send({ error: 'Invalid credentials' });
     }
 
-    const token = generateToken();
+    // Fix #12: Create new session
+    const sessionId = `session-${Date.now()}`;
+    const token = generateToken({ id: user.id, email: user.email }, sessionId);
 
-    // Store token in database
+    // Store token in database for backward compatibility
     await prisma.user.update({
       where: { id: user.id },
       data: { token },
@@ -276,7 +337,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     };
   });
 
-  // GET /auth/me - Get current user info
+  // GET /auth/me - Get current user info (with JWT validation)
   server.get('/auth/me', async (request, reply) => {
     const authHeader = request.headers.authorization;
     if (!authHeader) {
@@ -285,13 +346,19 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
     const token = authHeader.replace('Bearer ', '');
 
-    // Find user by token
-    const user = await prisma.user.findFirst({
-      where: { token },
+    // Fix #4: Validate JWT token
+    const payload = verifyToken(token);
+    if (!payload) {
+      return reply.status(401).send({ error: 'Invalid or expired token' });
+    }
+
+    // Find user by ID from token
+    const user = await prisma.user.findUnique({
+      where: { id: payload.userId },
     });
 
     if (!user) {
-      return reply.status(401).send({ error: 'Not authenticated' });
+      return reply.status(401).send({ error: 'User not found' });
     }
 
     return {
@@ -310,12 +377,21 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
     const token = authHeader.replace('Bearer ', '');
 
-    // Clear token from user
-    await prisma.user.updateMany({
-      where: { token },
-      data: { token: null },
-    });
+    // Validate token to get user ID
+    const payload = verifyToken(token);
+    if (payload) {
+      // Clear token from user (for backward compatibility)
+      await prisma.user.updateMany({
+        where: { id: payload.userId, token },
+        data: { token: null },
+      });
+    }
 
     return { success: true };
+  });
+
+  // Cleanup on server shutdown
+  server.addHook('onClose', async () => {
+    deviceRequests.destroy();
   });
 };

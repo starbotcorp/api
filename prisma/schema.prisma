@@ -16,13 +16,34 @@ model User {
   email        String   @unique
   passwordHash String
   name         String?
-  token        String?  // Current auth token
+  token        String?  // Legacy: Current auth token (deprecated, use sessions)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
   projects     Project[]
+  sessions     Session[] // Fix #12: Multi-session support
 
   @@map("users")
+}
+
+// Fix #12: Session model for multi-device support
+model Session {
+  id        String   @id @default(uuid())
+  userId    String
+  token     String   @unique
+  userAgent String?
+  ipAddress String?
+  deviceName String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  lastUsedAt DateTime @updatedAt
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+  @@index([expiresAt])
+  @@map("sessions")
 }
 
 // Project: top-level container for organizing chats

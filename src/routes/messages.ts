@@ -34,16 +34,8 @@ export async function messageRoutes(server: FastifyInstance) {
       },
     },
     async (request, reply) => {
-      // Log request entry
-      console.log('[POST /messages] Request received:', {
-        chatId: request.params.chatId,
-        contentType: request.headers['content-type'],
-        bodyExists: request.body !== undefined,
-      });
-
       // Authentication check
       if (!requireAuthIfEnabled(request, reply)) {
-        console.log('[POST /messages] Auth check failed');
         return;
       }
 
@@ -52,23 +44,16 @@ export async function messageRoutes(server: FastifyInstance) {
         routeKey: 'messages',
         maxRequests: env.RATE_LIMIT_MESSAGES_PER_WINDOW,
       })) {
-        console.log('[POST /messages] Rate limit exceeded');
         return;
       }
 
       const { chatId } = request.params;
       const rawBody = request.body as Record<string, unknown> | undefined;
 
-      // Log incoming request for debugging
-      console.log('[POST /messages] Request:', { chatId, role: rawBody?.role, content: rawBody?.content });
-
       let body;
       try {
         body = CreateMessageSchema.parse(rawBody);
       } catch (error) {
-        // Log validation error for debugging
-        console.error('[POST /messages] Validation error:', { error, rawBody });
-
         if (error instanceof z.ZodError) {
           return reply.code(400).send({ error: 'Invalid request body', details: error.errors });
         }
