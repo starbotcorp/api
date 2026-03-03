@@ -6,6 +6,7 @@
 
 import { prisma } from '../db.js';
 import { generateEmbedding } from './embeddings.js';
+import { DEFAULT_IDENTITY } from '../routes/memory.js';
 
 export interface RetrievalResult {
   chunkId: string;
@@ -13,6 +14,17 @@ export interface RetrievalResult {
   similarity: number;
   memoryId: string;
   scope: string;
+}
+
+export interface UserFact {
+  id: string;
+  userId: string;
+  factKey: string;
+  factValue: string;
+  confidence: number;
+  source: string;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 /**
@@ -221,8 +233,9 @@ export async function getIdentityContext(query: string, maxChunks = 3): Promise<
     },
   });
 
+  // No custom identity? Return default - always have an identity
   if (!identityDoc) {
-    return '';
+    return DEFAULT_IDENTITY;
   }
 
   const results = await searchIdentityMemory(query, maxChunks);
@@ -267,6 +280,48 @@ export async function getChatMemoryContext(
   }
 
   return context;
+}
+
+/**
+ * Get user facts for personalization context
+ * Returns formatted string with relevant user information
+ */
+export async function getUserFactsContext(userId: string): Promise<string> {
+  const facts = await prisma.userFact.findMany({
+    where: { userId },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  if (facts.length === 0) {
+    return '';
+  }
+
+  const factMap = new Map<string, string>();
+  for (const fact of facts) {
+    factMap.set(fact.factKey, fact.factValue);
+  }
+
+  const factDescriptions: string[] = [];
+  for (const [key, value] of factMap.entries()) {
+    factDescriptions.push(`${key}: ${value}`);
+  }
+
+  return `# User Facts\n\n${factDescriptions.join('\n')}\n`;
+}
+
+/**
+ * Check if user has completed onboarding (has required facts)
+ */
+export async function isOnboardingComplete(userId: string): Promise<boolean> {
+  const facts = await prisma.userFact.findMany({
+    where: { userId },
+    select: { factKey: true },
+  });
+
+  const factKeys = new Set(facts.map((f) => f.factKey));
+  const requiredKeys = ['name', 'timezone', 'role'];
+
+  return requiredKeys.every((key) => factKeys.has(key));
 }
 
 /**

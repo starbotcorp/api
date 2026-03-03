@@ -1,6 +1,3 @@
-// Starbot API - SQLite Schema
-// Simple, local-first storage for projects, chats, and messages
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -10,35 +7,74 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// User account for authentication
 model User {
-  id           String   @id @default(uuid())
-  email        String   @unique
+  id           String      @id @default(uuid())
+  email        String      @unique
   passwordHash String
   name         String?
-  token        String?  // Legacy: Current auth token (deprecated, use sessions)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-
+  displayName  String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  token        String?
   projects     Project[]
-  sessions     Session[] // Fix #12: Multi-session support
+  sessions     Session[]
+  facts        UserFact[]
 
   @@map("users")
+  calendars Calendar[]
 }
 
-// Fix #12: Session model for multi-device support
-model Session {
+model Calendar {
+  id          String   @id @default(uuid())
+  userId      String
+  title       String
+  description String?
+  startTime   DateTime
+  endTime     DateTime?
+  timezone    String   @default("UTC")
+  recurrence  String?  // daily, weekly, monthly, yearly
+  reminder    String?  // minutes before: 5, 15, 30, 60, etc.
+  status      String   @default("scheduled") // scheduled, completed, cancelled
+  location    String?
+  color       String?  // hex color for UI
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([startTime])
+  @@index([status])
+  @@map("calendars")
+}
+
+model UserFact {
   id        String   @id @default(uuid())
   userId    String
-  token     String   @unique
-  userAgent String?
-  ipAddress String?
-  deviceName String?
-  expiresAt DateTime
+  factKey   String
+  factValue String
+  confidence Float   @default(1.0)
+  source    String   @default("onboarding")
   createdAt DateTime @default(now())
-  lastUsedAt DateTime @updatedAt
-
+  updatedAt DateTime @updatedAt
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, factKey])
+  @@index([userId])
+  @@index([factKey])
+  @@map("user_facts")
+}
+
+model Session {
+  id         String   @id @default(uuid())
+  userId     String
+  token      String   @unique
+  userAgent  String?
+  ipAddress  String?
+  deviceName String?
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  lastUsedAt DateTime @updatedAt
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@index([token])
@@ -46,105 +82,98 @@ model Session {
   @@map("sessions")
 }
 
-// Project: top-level container for organizing chats
 model Project {
-  id         String   @id @default(uuid())
+  id         String           @id @default(uuid())
   name       String
   userId     String?
-  email      String?  // Email of the owner (for WebGUI filtering)
-  createdAt  DateTime @default(now())
-
-  user       User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt  DateTime         @default(now())
+  email      String?
   chats      Chat[]
-  workspaces Workspace[]
-  memories   MemoryDocument[]
   folders    Folder[]
+  memories   MemoryDocument[]
+  user       User?            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspaces Workspace[]
 
   @@index([userId])
   @@index([email])
+  @@index([createdAt])
   @@map("projects")
 }
 
-// Folder: organizes chats within a project
 model Folder {
   id        String   @id @default(uuid())
   projectId String
   name      String
   createdAt DateTime @default(now())
-
-  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   chats     Chat[]
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@index([projectId])
   @@map("folders")
 }
 
-// Workspace: represents a code repository, folder, or cloud resource
 model Workspace {
-  id          String   @id @default(uuid())
-  projectId   String
-  type        String   // "repo" | "folder" | "cloud"
-  identifier  String   // repo URL, folder path, or cloud resource ID
-  createdAt   DateTime @default(now())
-
-  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  chats       Chat[]
-  memories    MemoryDocument[]
+  id         String           @id @default(uuid())
+  projectId  String
+  type       String
+  identifier String
+  createdAt  DateTime         @default(now())
+  chats      Chat[]
+  memories   MemoryDocument[]
+  project    Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@index([projectId])
   @@map("workspaces")
 }
 
-// Chat: conversation thread within a project
 model Chat {
-  id          String   @id @default(uuid())
-  projectId   String
-  workspaceId String?
-  folderId    String?  // Optional folder to organize chats
-  title       String
-  clientSource String  @default("webgui") // "webgui" | "cli"
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  workspace   Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  folder      Folder?   @relation(fields: [folderId], references: [id], onDelete: SetNull)
-  messages    Message[]
-  events      Event[]
-  memories    MemoryDocument[]
+  id           String           @id @default(uuid())
+  projectId    String
+  workspaceId  String?
+  folderId     String?
+  title        String
+  clientSource String           @default("webgui")
+  isFavorite   Boolean          @default(false)
+  isMain       Boolean          @default(false)
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  folder       Folder?          @relation(fields: [folderId], references: [id])
+  workspace    Workspace?       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project      Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  events       Event[]
+  memories     MemoryDocument[]
+  messages     Message[]
 
   @@index([projectId])
   @@index([workspaceId])
   @@index([folderId])
   @@index([updatedAt])
   @@index([clientSource])
+  @@index([isFavorite])
+  @@index([isMain])
   @@map("chats")
 }
 
-// Message: individual message in a chat
 model Message {
-  id         String   @id @default(uuid())
-  chatId     String
-  role       String   // user | assistant | tool | system
-  content    String
-  createdAt  DateTime @default(now())
-
-  chat       Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  id        String   @id @default(uuid())
+  chatId    String
+  role      String
+  content   String
+  createdAt DateTime @default(now())
+  chat      Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
 
   @@index([chatId])
   @@index([createdAt])
   @@map("messages")
 }
 
-// Event: audit trail for streaming events (optional, for debugging)
 model Event {
-  id         String   @id @default(uuid())
-  chatId     String
-  type       String   // token.delta | tool.start | tool.end | status | error
-  payload    String   // JSON string
-  createdAt  DateTime @default(now())
-
-  chat       Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  id        String   @id @default(uuid())
+  chatId    String
+  type      String
+  payload   String
+  createdAt DateTime @default(now())
+  chat      Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
 
   @@index([chatId])
   @@index([type])
@@ -152,21 +181,19 @@ model Event {
   @@map("events")
 }
 
-// MemoryDocument: stores PMEMORY.md (project) or MEMORY.md (workspace)
 model MemoryDocument {
-  id          String   @id @default(uuid())
-  scope       String   // "identity" | "chat" | "project" | "workspace"
+  id          String        @id @default(uuid())
+  scope       String
   projectId   String?
   workspaceId String?
   chatId      String?
-  content     String   // Markdown content
-  updatedAt   DateTime @updatedAt
-  createdAt   DateTime @default(now())
-
-  project     Project?   @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  workspace   Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  chat        Chat?      @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  content     String
+  updatedAt   DateTime      @updatedAt
+  createdAt   DateTime      @default(now())
   chunks      MemoryChunk[]
+  chat        Chat?         @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  workspace   Workspace?    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project     Project?      @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@unique([scope, projectId, workspaceId])
   @@unique([scope, chatId])
@@ -177,43 +204,38 @@ model MemoryDocument {
   @@map("memory_documents")
 }
 
-// MemoryChunk: chunked text from memory documents for embeddings (Phase 3)
 model MemoryChunk {
-  id              String   @id @default(uuid())
+  id              String         @id @default(uuid())
   memoryId        String
   text            String
-  embeddingVector String?  // JSON-encoded float array (Phase 3)
-  createdAt       DateTime @default(now())
-
+  embeddingVector String?
+  createdAt       DateTime       @default(now())
   memory          MemoryDocument @relation(fields: [memoryId], references: [id], onDelete: Cascade)
 
   @@index([memoryId])
   @@map("memory_chunks")
 }
 
-
 model Task {
-  id           String   @id @default(uuid())
-  title        String
-  description  String?
-  status       String   @default("PENDING")
-  priority     Int      @default(0)
-  due_date     DateTime?
+  id              String           @id @default(uuid())
+  title           String
+  description     String?
+  status          String           @default("PENDING")
+  priority        Int              @default(0)
+  due_date        DateTime?
   estimated_hours Int?
   actual_hours    Int?
-  parent_id    String?
-  chat_id      String?
-  metadata     String?
-  created_at   DateTime @default(now())
-  updated_at   DateTime @updatedAt
-  completed_at DateTime?
-
-  // Relationships
-  parent       Task?     @relation("TaskSubtasks", fields: [parent_id], references: [id], onDelete: Cascade)
-  subtasks     Task[]    @relation("TaskSubtasks")
-  dependencies TaskDependency[] @relation("TaskDependencies")
-  dependents   TaskDependency[] @relation("TaskDependents")
-  events       TaskEvent[]
+  parent_id       String?
+  chat_id         String?
+  metadata        String?
+  created_at      DateTime         @default(now())
+  updated_at      DateTime         @updatedAt
+  completed_at    DateTime?
+  dependents      TaskDependency[] @relation("TaskDependents")
+  dependencies    TaskDependency[] @relation("TaskDependencies")
+  events          TaskEvent[]
+  parent          Task?            @relation("TaskSubtasks", fields: [parent_id], references: [id], onDelete: Cascade)
+  subtasks        Task[]           @relation("TaskSubtasks")
 
   @@index([chat_id])
   @@index([parent_id])
@@ -226,14 +248,12 @@ model Task {
 }
 
 model TaskDependency {
-  id          String @id @default(uuid())
-  task_id     String
+  id            String   @id @default(uuid())
+  task_id       String
   dependency_id String
-  created_at  DateTime @default(now())
-
-  // Relationships
-  task        Task @relation("TaskDependencies", fields: [task_id], references: [id], onDelete: Cascade)
-  dependency  Task @relation("TaskDependents", fields: [dependency_id], references: [id], onDelete: Cascade)
+  created_at    DateTime @default(now())
+  dependency    Task     @relation("TaskDependents", fields: [dependency_id], references: [id], onDelete: Cascade)
+  task          Task     @relation("TaskDependencies", fields: [task_id], references: [id], onDelete: Cascade)
 
   @@unique([task_id, dependency_id])
   @@index([task_id])
@@ -242,13 +262,12 @@ model TaskDependency {
 }
 
 model TaskEvent {
-  id        String    @id @default(uuid())
+  id        String   @id @default(uuid())
   taskId    String
   type      String
   data      String?
-  timestamp DateTime  @default(now())
-
-  task      Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  timestamp DateTime @default(now())
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
 
   @@index([taskId])
   @@index([type])

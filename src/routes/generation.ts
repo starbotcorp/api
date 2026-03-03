@@ -1,431 +1,33 @@
 // Generation route (streaming with real model routing)
 import type { FastifyInstance } from 'fastify';
-import { z } from 'zod';
 import { prisma } from '../db.js';
-import {
-  getBestModelForTier,
-  getModelById,
-  getModelByProviderAndName,
-  listModels,
-  type ModelDefinition,
-} from '../services/model-catalog.js';
+import { listModels, type ModelDefinition } from '../services/model-catalog.js';
 import { interpretUserMessage } from '../services/interpreter.js';
 import { classifyWithCodex, serializeHeader, stripHeader, type CodexHeader } from '../services/codex-router.js';
 import { getProvider } from '../providers/index.js';
 import type { ProviderMessage, ToolCall } from '../providers/types.js';
-import { getChatMemoryContext, getIdentityContext, getRelevantContext } from '../services/retrieval.js';
+import { getChatMemoryContext, getIdentityContext, getRelevantContext, getUserFactsContext, isOnboardingComplete } from '../services/retrieval.js';
 import { formatWebSearchContext, searchWeb } from '../services/web-search.js';
 import { toolRegistry, getToolsByNames } from '../services/tools/index.js';
 import { DeepSeekOrchestrator } from '../services/orchestrator/index.js';
 import { env } from '../env.js';
 import { runTriage } from '../services/triage/index.js';
-import { enforceRateLimitIfEnabled, requireAuthIfEnabled } from '../security/route-guards.js';
-import * as fs from 'fs/promises';
-import * as path from 'path';
-
-const RunChatSchema = z.object({
-  mode: z.enum(['quick', 'standard', 'deep']).optional().default('standard'),
-  model_prefs: z.string().optional(),
-  speed: z.boolean().optional().default(false),
-  auto: z.boolean().optional().default(true),
-  client_context: z
-    .object({
-      working_dir: z.string().optional(),
-    })
-    .optional(),
-});
-
-const CompletionSchema = z.object({
-  file_path: z.string(),
-  content: z.string(),
-  cursor_position: z.object({
-    line: z.number().min(0),
-    column: z.number().min(0),
-  }),
-  surrounding_lines: z.object({
-    before: z.array(z.string()).default([]),
-    after: z.array(z.string()).default([]),
-  }).default({ before: [], after: [] }),
-  max_suggestions: z.number().min(1).max(10).default(3),
-  language: z.string().optional(),
-});
-
-const FileListSchema = z.object({
-  workspace_id: z.string(),
-  path: z.string().default('.'),
-});
-
-const FileReadSchema = z.object({
-  workspace_id: z.string(),
-  path: z.string(),
-});
-
-const FileWriteSchema = z.object({
-  workspace_id: z.string(),
-  file_path: z.string(),
-  content: z.string(),
-  create_backup: z.boolean().default(false),
-});
-
-interface RunParams {
-  Params: {
-    chatId: string;
-  };
-}
-
-const KNOWN_PROVIDERS = new Set(['kimi', 'vertex', 'azure', 'bedrock', 'cloudflare']);
-
-function parseModelPrefs(raw?: string): { provider?: string; model?: string } {
-  const trimmed = String(raw || '').trim();
-  if (!trimmed) return {};
-  if (trimmed.includes(':')) {
-    const [providerRaw, modelRaw] = trimmed.split(':', 2);
-    const provider = providerRaw.trim().toLowerCase();
-    const model = modelRaw.trim();
-    return {
-      provider: provider || undefined,
-      model: model || undefined,
-    };
-  }
-  const lower = trimmed.toLowerCase();
-  if (KNOWN_PROVIDERS.has(lower)) {
-    return { provider: lower };
-  }
-  return { model: trimmed };
-}
-
-function sortByCost(models: ModelDefinition[]): ModelDefinition[] {
-  return [...models].sort((a, b) => {
-    const aCost = a.costPer1kInput || Number.POSITIVE_INFINITY;
-    const bCost = b.costPer1kInput || Number.POSITIVE_INFINITY;
-    return aCost - bCost;
-  });
-}
-
-function sortFallbackCandidates(models: ModelDefinition[], targetTier: number): ModelDefinition[] {
-  return [...models].sort((a, b) => {
-    const aTierDistance = Math.abs(a.tier - targetTier);
-    const bTierDistance = Math.abs(b.tier - targetTier);
-    if (aTierDistance !== bTierDistance) return aTierDistance - bTierDistance;
-
-    const aCost = a.costPer1kInput || Number.POSITIVE_INFINITY;
-    const bCost = b.costPer1kInput || Number.POSITIVE_INFINITY;
-    return aCost - bCost;
-  });
-}
-
-async function resolveRequestedModel(
-  tier: number,
-  capability: string,
-  modelPrefs?: string,
-): Promise<ModelDefinition | null> {
-  const prefs = parseModelPrefs(modelPrefs);
-
-  if (prefs.model) {
-    if (prefs.provider) {
-      const exact = await getModelByProviderAndName(prefs.provider, prefs.model);
-      if (exact && exact.status === 'enabled') return exact;
-    }
-
-    const byId = await getModelById(prefs.model);
-    if (byId && byId.status === 'enabled' && (!prefs.provider || byId.provider === prefs.provider)) {
-      return byId;
-    }
-
-    const all = await listModels({
-      status: 'enabled',
-      capability,
-      configuredOnly: true,
-      ...(prefs.provider ? { provider: prefs.provider } : {}),
-    });
-    const byDeployment = all.find(m => m.deploymentName === prefs.model);
-    if (byDeployment) return byDeployment;
-  }
-
-  if (prefs.provider) {
-    const atTier = await listModels({
-      status: 'enabled',
-      tier,
-      capability,
-      configuredOnly: true,
-      provider: prefs.provider,
-    });
-    if (atTier.length > 0) return sortByCost(atTier)[0];
-
-    const anyTier = await listModels({
-      status: 'enabled',
-      capability,
-      configuredOnly: true,
-      provider: prefs.provider,
-    });
-    if (anyTier.length > 0) return sortByCost(anyTier)[0];
-  }
-
-  return getBestModelForTier(tier, capability, true);
-}
-
-// Fix #2: Path traversal validation helper
-async function validatePathWithinWorkspace(
-  workspacePath: string,
-  requestedPath: string
-): Promise<{ valid: boolean; resolvedPath?: string; error?: string }> {
-  const resolvedWorkspace = path.resolve(workspacePath);
-  const resolvedPath = path.resolve(workspacePath, requestedPath);
-
-  // Check if resolved path is within workspace
-  if (!resolvedPath.startsWith(resolvedWorkspace)) {
-    return { valid: false, error: 'Access denied: path outside workspace' };
-  }
-
-  // Check for symlinks that escape the workspace
-  try {
-    const realPath = await fs.realpath(resolvedPath);
-    if (!realPath.startsWith(resolvedWorkspace)) {
-      return { valid: false, error: 'Access denied: symlink outside workspace' };
-    }
-    return { valid: true, resolvedPath: realPath };
-  } catch {
-    // Path doesn't exist yet (for writes) - use resolved path
-    return { valid: true, resolvedPath };
-  }
-}
-
-// Fix #13: Workspace validation helper
-async function validateWorkspace(workspaceId: string): Promise<{ valid: boolean; workspace?: any; error?: string }> {
-  try {
-    const workspace = await prisma.workspace.findUnique({
-      where: { id: workspaceId },
-    });
-
-    if (!workspace) {
-      return { valid: false, error: 'Workspace not found' };
-    }
-
-    return { valid: true, workspace };
-  } catch (err) {
-    return { valid: false, error: 'Failed to validate workspace' };
-  }
-}
+import { enforceRateLimitIfEnabled, requireAuthIfEnabled, getRealClientIP } from '../security/route-guards.js';
+import { getUserTimezone, getCurrentTimeInTimezone, formatTimeInTimezone } from '../services/timezone.js';
+import { generateAndUpdateTitle } from '../services/title-generator.js';
+import {
+  RunChatSchema,
+  CompletionSchema,
+  type RunParams,
+  sortByCost,
+  sortFallbackCandidates,
+  resolveRequestedModel,
+} from './generation/index.js';
+import { fileRoutes } from './generation/file-routes.js';
 
 export async function generationRoutes(server: FastifyInstance) {
-  // GET /v1/files/list - List files in directory
-  server.get('/files/list', async (request, reply) => {
-    if (!requireAuthIfEnabled(request, reply)) {
-      return;
-    }
-
-    const { workspace_id, path: dirPath } = FileListSchema.parse(request.query);
-
-    try {
-      // Fix #13: Validate workspace exists
-      const workspaceValidation = await validateWorkspace(workspace_id);
-      if (!workspaceValidation.valid) {
-        return reply.code(404).send({ error: workspaceValidation.error });
-      }
-
-      // Use workspace identifier for the actual path
-      const workspace = workspaceValidation.workspace;
-      const workspacePath = workspace.identifier || `/workspace/${workspace_id}`;
-
-      // Fix #2: Validate path is within workspace
-      const pathValidation = await validatePathWithinWorkspace(workspacePath, dirPath);
-      if (!pathValidation.valid) {
-        return reply.code(403).send({ error: pathValidation.error });
-      }
-
-      const fullPath = pathValidation.resolvedPath!;
-      const items = await fs.readdir(fullPath, { withFileTypes: true });
-
-      const files = await Promise.all(items.map(async (item) => {
-        const itemPath = path.join(fullPath, item.name);
-        const stats = await fs.stat(itemPath);
-
-        return {
-          name: item.name,
-          path: path.join(dirPath, item.name).replace(/^\//, ''),
-          is_dir: item.isDirectory(),
-          size: stats.size,
-          last_modified: stats.mtime.toISOString(),
-        };
-      }));
-
-      return {
-        request_id: crypto.randomUUID(),
-        elapsed_ms: 0,
-        json: {
-          files: files.sort((a, b) => {
-            // Directories first, then alphabetically
-            if (a.is_dir !== b.is_dir) return b.is_dir ? 1 : -1;
-            return a.name.localeCompare(b.name);
-          }),
-        },
-      };
-    } catch (err) {
-      server.log.error(err);
-      return reply.code(500).send({
-        error: 'Failed to list files',
-        message: err instanceof Error ? err.message : 'Unknown error'
-      });
-    }
-  });
-
-  // GET /v1/files/read - Read file contents
-  server.get('/files/read', async (request, reply) => {
-    if (!requireAuthIfEnabled(request, reply)) {
-      return;
-    }
-
-    const { workspace_id, path: filePath } = FileReadSchema.parse(request.query);
-
-    try {
-      // Fix #13: Validate workspace exists
-      const workspaceValidation = await validateWorkspace(workspace_id);
-      if (!workspaceValidation.valid) {
-        return reply.code(404).send({ error: workspaceValidation.error });
-      }
-
-      const workspace = workspaceValidation.workspace;
-      const workspacePath = workspace.identifier || `/workspace/${workspace_id}`;
-
-      // Fix #2: Validate path is within workspace
-      const pathValidation = await validatePathWithinWorkspace(workspacePath, filePath);
-      if (!pathValidation.valid) {
-        return reply.code(403).send({ error: pathValidation.error });
-      }
-
-      const fullPath = pathValidation.resolvedPath!;
-
-      const content = await fs.readFile(fullPath, 'utf-8');
-      const stats = await fs.stat(fullPath);
-
-      // Detect language from file extension
-      const ext = path.extname(filePath).toLowerCase();
-      const languageMap: Record<string, string> = {
-        '.js': 'javascript',
-        '.ts': 'typescript',
-        '.py': 'python',
-        '.rs': 'rust',
-        '.go': 'go',
-        '.java': 'java',
-        '.cpp': 'cpp',
-        '.c': 'c',
-        '.h': 'c',
-        '.cs': 'csharp',
-        '.php': 'php',
-        '.rb': 'ruby',
-        '.swift': 'swift',
-        '.kt': 'kotlin',
-        '.scala': 'scala',
-        '.md': 'markdown',
-        '.json': 'json',
-        '.yaml': 'yaml',
-        '.yml': 'yaml',
-        '.toml': 'toml',
-        '.xml': 'xml',
-        '.html': 'html',
-        '.css': 'css',
-        '.sql': 'sql',
-        '.sh': 'bash',
-        '.bash': 'bash',
-        '.fish': 'fish',
-        '.zsh': 'zsh',
-        '.ps1': 'powershell',
-        '.dockerfile': 'dockerfile',
-      };
-
-      return {
-        request_id: crypto.randomUUID(),
-        elapsed_ms: 0,
-        json: {
-          content,
-          language: languageMap[ext] || 'text',
-          line_count: content.split('\n').length,
-          file_path: filePath,
-        },
-      };
-    } catch (err) {
-      server.log.error(err);
-      return reply.code(404).send({
-        error: 'File not found',
-        message: err instanceof Error ? err.message : 'Unknown error'
-      });
-    }
-  });
-
-  // POST /v1/files/write - Write/create file
-  server.post('/files/write', async (request, reply) => {
-    if (!requireAuthIfEnabled(request, reply)) {
-      return;
-    }
-
-    const { workspace_id, file_path, content, create_backup } = FileWriteSchema.parse(request.body);
-
-    try {
-      // Fix #13: Validate workspace exists
-      const workspaceValidation = await validateWorkspace(workspace_id);
-      if (!workspaceValidation.valid) {
-        return reply.code(404).send({ error: workspaceValidation.error });
-      }
-
-      const workspace = workspaceValidation.workspace;
-      const workspacePath = workspace.identifier || `/workspace/${workspace_id}`;
-
-      // Fix #2: Validate path is within workspace
-      const pathValidation = await validatePathWithinWorkspace(workspacePath, file_path);
-      if (!pathValidation.valid) {
-        return reply.code(403).send({ error: pathValidation.error });
-      }
-
-      const fullPath = pathValidation.resolvedPath!;
-
-      // Create backup if requested and file exists
-      let backupPath: string | undefined;
-      if (create_backup) {
-        try {
-          const stats = await fs.stat(fullPath);
-          const backupDir = path.join(workspacePath, '.backups');
-          await fs.mkdir(backupDir, { recursive: true });
-
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-          const backupFileName = `${path.basename(file_path)}.${timestamp}.bak`;
-          backupPath = path.join(backupDir, backupFileName);
-
-          await fs.copyFile(fullPath, backupPath);
-        } catch (err) {
-          // File doesn't exist, no backup needed
-        }
-      }
-
-      // Ensure directory exists
-      await fs.mkdir(path.dirname(fullPath), { recursive: true });
-
-      // Write file
-      await fs.writeFile(fullPath, content, 'utf-8');
-
-      // Get diff if backup exists
-      let diff: { old: string; new: string } | undefined;
-      if (backupPath) {
-        const oldContent = await fs.readFile(backupPath, 'utf-8');
-        diff = { old: oldContent, new: content };
-      }
-
-      return {
-        request_id: crypto.randomUUID(),
-        elapsed_ms: 0,
-        json: {
-          success: true,
-          backup_path: backupPath,
-          diff,
-        },
-      };
-    } catch (err) {
-      server.log.error(err);
-      return reply.code(500).send({
-        error: 'Failed to write file',
-        message: err instanceof Error ? err.message : 'Unknown error'
-      });
-    }
-  });
+  // Register file operation routes
+  await server.register(fileRoutes);
 
   // POST /v1/chats/:chatId/run - Start generation (SSE streaming)
   server.post<RunParams>('/chats/:chatId/run', async (request, reply) => {
@@ -503,6 +105,64 @@ export async function generationRoutes(server: FastifyInstance) {
         cleanup();
       }
     };
+
+    // Check if this is a project-level chat (General Chat) and user needs onboarding
+    const userId = (request as any).userId;
+    const isProjectLevelChat = !chat.workspaceId && !chat.folderId;
+    const needsOnboarding = isProjectLevelChat && chat.messages.length <= 2 && !(await isOnboardingComplete(userId));
+
+    // Check if this is a special onboarding trigger message
+    const lastUserMsg = chat.messages[chat.messages.length - 1];
+    const isOnboardingTrigger = lastUserMsg && lastUserMsg.role === 'user' && lastUserMsg.content === 'Start onboarding';
+
+    if (needsOnboarding && isOnboardingTrigger) {
+      // This is the onboarding trigger - send the onboarding greeting
+      // Delete the trigger message so it doesn't clutter the conversation
+      await prisma.message.delete({
+        where: { id: lastUserMsg.id },
+      });
+
+      // Send the onboarding greeting as if it came from Starbot
+      const onboardingGreeting = `Hey there! I'm Starbot — your personal AI assistant. I'm here to help you stay organized, answer questions, and maybe even make you smile. Before we dive in, I'd love to get to know you a little better. Sound good?`;
+
+      const assistantMessage = await prisma.message.create({
+        data: {
+          chatId,
+          role: 'assistant',
+          content: onboardingGreeting,
+        },
+      });
+
+      const updatedAt = new Date();
+      await prisma.chat.update({
+        where: { id: chatId },
+        data: { updatedAt },
+      });
+
+      sendEvent('message.final', {
+        id: assistantMessage.id,
+        role: 'assistant',
+        content: onboardingGreeting,
+        provider: 'system',
+        model: 'onboarding',
+        modelDisplayName: 'Onboarding',
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      });
+
+      sendEvent('chat.updated', {
+        id: chatId,
+        title: chat.title,
+        updatedAt: updatedAt.toISOString(),
+      });
+
+      sendEvent('onboarding.required', {
+        status: 'required',
+        chatId,
+      });
+
+      reply.raw.end();
+      return reply;
+    }
 
     try {
       // 0. Inject task context if chat has associated tasks
@@ -583,7 +243,7 @@ export async function generationRoutes(server: FastifyInstance) {
           const tierMap = { quick: 1, standard: 2, deep: 3 } as const;
           const requestedTier = tierMap[body.mode];
           const baseTier = body.auto ? codexHeader.tier : requestedTier;
-          selectionTier = body.speed ? Math.max(1, baseTier - 1) : baseTier;
+          selectionTier = baseTier;
         } catch (err) {
           server.log.warn({ err }, 'Codex router failed, falling back to interpreter+triage');
           sendEvent('status', { message: 'Codex router failed, using legacy pipeline...' });
@@ -626,7 +286,7 @@ export async function generationRoutes(server: FastifyInstance) {
         const triageTier = tierMap[lane];
         const requestedTier = tierMap[body.mode];
         const baseTier = body.auto ? triageTier : requestedTier;
-        selectionTier = body.speed ? Math.max(1, baseTier - 1) : baseTier;
+        selectionTier = baseTier;
       }
 
       // --- Early returns (clarify, filesystem) ---
@@ -762,13 +422,15 @@ export async function generationRoutes(server: FastifyInstance) {
           : `Routing manual (${body.mode}, complexity: ${complexity})...`,
       });
 
-      if (body.speed) {
+      if (body.thinking) {
         sendEvent('status', {
-          message: 'Speed mode enabled: preferring a faster model tier...',
+          message: 'Thinking mode enabled: using DeepSeek Reasoner (R1)...',
         });
       }
 
-      const primaryModel = await resolveRequestedModel(selectionTier, 'text', body.model_prefs);
+      // Select model based on thinking mode
+      const requestedModelId = body.thinking ? 'deepseek-reasoner' : 'deepseek-chat';
+      const primaryModel = await resolveRequestedModel(selectionTier, 'text', requestedModelId);
       if (!primaryModel) {
         throw new Error('No models available. Please configure at least one provider.');
       }
@@ -787,6 +449,71 @@ export async function generationRoutes(server: FastifyInstance) {
       // --- Build provider messages ---
       const providerMessages: ProviderMessage[] = [];
 
+      // Get user's timezone for temporal context
+      const clientIP = getRealClientIP(request);
+      const userTimezone = await getUserTimezone(request, clientIP);
+      const now = new Date();
+      const currentTimeUTC = now.toISOString();
+      const currentTimeUser = getCurrentTimeInTimezone(userTimezone);
+      const chatStartedUser = formatTimeInTimezone(chat.createdAt, userTimezone);
+
+      // Calculate elapsed time since chat started
+      const elapsedMs = now.getTime() - chat.createdAt.getTime();
+      const elapsedMinutes = Math.floor(elapsedMs / 60000);
+      const elapsedHours = Math.floor(elapsedMs / 3600000);
+      const elapsedDays = Math.floor(elapsedMs / 86400000);
+      let elapsedFormatted = '';
+      if (elapsedDays > 0) {
+        elapsedFormatted = `${elapsedDays} day${elapsedDays > 1 ? 's' : ''}`;
+      } else if (elapsedHours > 0) {
+        elapsedFormatted = `${elapsedHours} hour${elapsedHours > 1 ? 's' : ''}`;
+      } else if (elapsedMinutes > 0) {
+        elapsedFormatted = `${elapsedMinutes} minute${elapsedMinutes > 1 ? 's' : ''}`;
+      } else {
+        elapsedFormatted = 'less than a minute';
+      }
+
+      server.log.info({ requestId, chatId, userTimezone, currentTimeUTC, currentTimeUser, elapsedFormatted }, 'Temporal context');
+
+      // Add mode hint to guide response depth (with temporal awareness built in)
+      const modeHints: Record<string, string> = {
+        quick: `RESPONSE STYLE: Be brief and direct. Focus on the essential answer without extensive elaboration.
+
+TEMPORAL AWARENESS:
+- User's timezone: ${userTimezone}
+- Current time (UTC): ${currentTimeUTC}
+- Current time (user's timezone): ${currentTimeUser}
+- Conversation started: ${chatStartedUser}
+- Time elapsed since conversation started: ${elapsedFormatted}
+
+When asked about time, date, or timing questions (including "how long have we been talking"), use this information.`,
+        standard: `RESPONSE STYLE: Provide a balanced response with reasonable detail and clarity.
+
+TEMPORAL AWARENESS:
+- User's timezone: ${userTimezone}
+- Current time (UTC): ${currentTimeUTC}
+- Current time (user's timezone): ${currentTimeUser}
+- Conversation started: ${chatStartedUser}
+- Time elapsed since conversation started: ${elapsedFormatted}
+
+When asked about time, date, or timing questions (including "how long have we been talking"), use this information.`,
+        deep: `RESPONSE STYLE: Be thorough and comprehensive. Explore nuances, provide detailed explanations, and consider edge cases.
+
+TEMPORAL AWARENESS:
+- User's timezone: ${userTimezone}
+- Current time (UTC): ${currentTimeUTC}
+- Current time (user's timezone): ${currentTimeUser}
+- Conversation started: ${chatStartedUser}
+- Time elapsed since conversation started: ${elapsedFormatted}
+
+When asked about time, date, or timing questions (including "how long have we been talking"), use this information.`,
+      };
+      providerMessages.push({
+        type: 'message',
+        role: 'system',
+        content: modeHints[body.mode] || modeHints.standard,
+      });
+
       // Inject Codex header as system message so downstream model sees routing metadata
       if (codexHeader) {
         providerMessages.push({
@@ -802,6 +529,20 @@ export async function generationRoutes(server: FastifyInstance) {
           role: 'system',
           content: identityContext,
         });
+      }
+
+      // Inject user facts for personalization
+      try {
+        const userFactsContext = await getUserFactsContext(userId);
+        if (userFactsContext) {
+          providerMessages.push({
+            type: 'message',
+            role: 'system',
+            content: userFactsContext,
+          });
+        }
+      } catch (err) {
+        server.log.warn({ err, requestId, userId }, 'User facts retrieval failed');
       }
 
       if (chatMemoryContext) {
@@ -838,18 +579,20 @@ export async function generationRoutes(server: FastifyInstance) {
 
       // Add conversation messages
       providerMessages.push(
-        ...chat.messages.map((m: { role: string; content: string }, idx: number) => {
+        ...chat.messages.map((m: { role: string; content: string; createdAt: Date }, idx: number) => {
+          const messageContent = idx === lastUserIndex ? interpretedUserMessage : m.content;
+
           if (m.role === 'tool') {
             return {
               type: 'message' as const,
               role: 'assistant' as const,
-              content: `[Tool Result]\n${m.content}`,
+              content: `[Tool Result]\n${messageContent}`,
             };
           }
           return {
             type: 'message' as const,
             role: m.role as 'user' | 'assistant' | 'system',
-            content: idx === lastUserIndex ? interpretedUserMessage : m.content,
+            content: messageContent,
           };
         }),
       );
@@ -878,12 +621,12 @@ export async function generationRoutes(server: FastifyInstance) {
         sendEvent('status', { message: 'Using DeepSeek orchestrator mode...' });
 
         // Build orchestrator messages from the conversation
-        const orchMessages = providerMessages.slice(1).map(m => ({
-          role: m.role as 'user' | 'assistant',
+        const orchMessages = providerMessages.map(m => ({
+          role: m.role as 'user' | 'assistant' | 'system',
           content: m.content || '',
         }));
 
-        // Create and run the orchestrator
+        // Create and run the orchestrator with identity context
         const orchestrator = new DeepSeekOrchestrator(
           `${primaryModel.provider}:${primaryModel.deploymentName}`,
           { maxIterations: 5, includeReasoning: true }
@@ -892,15 +635,39 @@ export async function generationRoutes(server: FastifyInstance) {
         const orchResult = await orchestrator.run(
           lastUserMsg.content,
           orchMessages,
-          { projectId: chat.projectId, workspaceId: chat.workspaceId || undefined }
+          {
+            projectId: chat.projectId,
+            workspaceId: chat.workspaceId || undefined,
+            chatId: chat.id,
+            chatCreated: chat.createdAt,
+            messageCount: chat.messages.length,
+            userTimezone: userTimezone,
+            identityContext: identityContext || '',  // Pass the Starbot identity
+          }
         );
+
+        // Build full response with thinking tags if reasoning exists
+        if (orchResult.reasoning) {
+          fullResponse = `<thinking>${orchResult.reasoning}</thinking>${orchResult.response}`;
+        } else {
+          fullResponse = orchResult.response;
+        }
 
         // Stream the response back
         sendEvent('message.start', {});
+
+        // Stream thinking content first if present
+        if (orchResult.reasoning) {
+          for (const char of orchResult.reasoning) {
+            sendEvent('token.delta', { text: char, reasoning: true });
+          }
+        }
+
+        // Stream main response
         for (const char of orchResult.response) {
           sendEvent('token.delta', { text: char });
-          fullResponse += char;
         }
+
         sendEvent('message.final', {
           id: `msg-${Date.now()}`,
           role: 'assistant',
@@ -920,7 +687,7 @@ export async function generationRoutes(server: FastifyInstance) {
           });
         }
 
-        // Save assistant message
+        // Save assistant message (with thinking tags included)
         await prisma.message.create({
           data: {
             chatId,
@@ -928,6 +695,39 @@ export async function generationRoutes(server: FastifyInstance) {
             content: fullResponse,
           },
         });
+
+        // Update chat title and generate smart title in background
+        const isNewChat = chat.title === 'New Chat';
+        const initialTitle = isNewChat
+          ? interpretedUserMessage.slice(0, 50) + (interpretedUserMessage.length > 50 ? '...' : '')
+          : chat.title;
+
+        const updatedAt = new Date();
+        await prisma.chat.update({
+          where: { id: chatId },
+          data: { updatedAt, title: initialTitle },
+        });
+
+        sendEvent('chat.updated', {
+          id: chatId,
+          title: initialTitle,
+          updatedAt: updatedAt.toISOString(),
+        });
+
+        // Generate smart title in background for new chats
+        if (isNewChat) {
+          generateAndUpdateTitle(
+            chatId,
+            lastUserMsg.content,
+            (updatedChatId, newTitle) => {
+              sendEvent('chat.updated', {
+                id: updatedChatId,
+                title: newTitle,
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          );
+        }
 
         sendEvent('inference.complete', {
           model: primaryModel.displayName,
@@ -1001,9 +801,7 @@ export async function generationRoutes(server: FastifyInstance) {
             const toolsToUse = modelSupportsTools ? toolDefinitions : undefined;
             for await (const chunk of provider.sendChatStream(providerMessages, {
               model: candidate.deploymentName,
-              maxTokens: body.speed
-                ? Math.min(candidate.maxOutputTokens, 1024)
-                : candidate.maxOutputTokens,
+              maxTokens: candidate.maxOutputTokens,
               temperature: 0.7,
               tools: toolsToUse,
               tool_choice: toolsEnabled && modelSupportsTools ? 'auto' : undefined,
@@ -1251,7 +1049,8 @@ export async function generationRoutes(server: FastifyInstance) {
       });
 
       // 9. Update chat title if needed
-      const newTitle = chat.title === 'New Chat'
+      const isNewChat = chat.title === 'New Chat';
+      const initialTitle = isNewChat
         ? interpretedUserMessage.slice(0, 50) + (interpretedUserMessage.length > 50 ? '...' : '')
         : chat.title;
 
@@ -1261,9 +1060,25 @@ export async function generationRoutes(server: FastifyInstance) {
         where: { id: chatId },
         data: {
           updatedAt,
-          title: newTitle,
+          title: initialTitle,
         },
       });
+
+      // 9b. Generate smart title in background for new chats
+      if (isNewChat) {
+        generateAndUpdateTitle(
+          chatId,
+          lastUserMsg.content,
+          (updatedChatId, newTitle) => {
+            // Send SSE event when title is updated
+            sendEvent('chat.updated', {
+              id: updatedChatId,
+              title: newTitle,
+              updatedAt: new Date().toISOString(),
+            });
+          }
+        );
+      }
 
       // 10. Send final event
       sendEvent('message.final', {
@@ -1304,7 +1119,7 @@ export async function generationRoutes(server: FastifyInstance) {
 
       sendEvent('chat.updated', {
         id: chatId,
-        title: newTitle,
+        title: initialTitle,
         updatedAt: updatedAt.toISOString(),
       });
 
