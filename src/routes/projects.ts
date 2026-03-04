@@ -13,17 +13,21 @@ const UpdateProjectSchema = z.object({
 });
 
 export async function projectRoutes(server: FastifyInstance) {
-  // GET /v1/projects - List projects (filtered by email - required)
-  server.get<{ Querystring: { email: string } }>('/projects', async (request, reply) => {
-    const { email } = request.query;
-
-    if (!email) {
-      return reply.code(400).send({ error: 'Email is required' });
-    }
+  // GET /v1/projects - List projects (filtered by email)
+  server.get('/projects', async (request, reply) => {
+    const email = (request as any).userId
+      ? await prisma.user.findUnique({
+          where: { id: (request as any).userId },
+          select: { email: true },
+        }).then(u => u?.email || null)
+      : null;
 
     const projects = await prisma.project.findMany({
-      where: { email },
-      orderBy: { createdAt: 'desc' },
+      where: email ? { email } : undefined,
+      orderBy: [
+        { chats: { _count: 'desc' } }, // Projects with more chats first
+        { createdAt: 'desc' }, // Then by most recently created
+      ],
       include: {
         _count: {
           select: { chats: true },
@@ -48,6 +52,7 @@ export async function projectRoutes(server: FastifyInstance) {
       data: {
         name: body.name,
         email: body.email,
+        userId: (request as any).userId,
       },
     });
 
@@ -90,6 +95,13 @@ export async function projectRoutes(server: FastifyInstance) {
       const project = await prisma.project.update({
         where: { id },
         data: body,
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          userId: true,
+          createdAt: true,
+        },
       });
       return { project };
     } catch (err) {

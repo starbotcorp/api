@@ -4,6 +4,7 @@
 import { env } from '../../env.js';
 import { toolRegistry } from './registry.js';
 import { webSearchTool } from './web-search-tool.js';
+import { timeTool } from './time-tool.js';
 import { calculatorTool } from './calculator-tool.js';
 import { codeExecTool } from './code-exec-tool.js';
 import { fileReadTool } from './file-read-tool.js';
@@ -13,6 +14,19 @@ import { fsGlobTool } from './fs-glob-tool.js';
 import { fsGrepTool } from './fs-grep-tool.js';
 import { shellExecTool } from './shell-exec-tool.js';
 import { fsAdvancedOpsTool } from './fs-advanced-ops-tool.js';
+import { conversationMetadataTool } from './conversation-metadata-tool.js';
+import {
+  addCalendarEventTool,
+  listCalendarEventsTool,
+  getUpcomingEventsTool,
+  updateCalendarEventTool,
+  deleteCalendarEventTool,
+} from './calendar-tools.js';
+import {
+  saveUserFactTool,
+  completeOnboardingTool,
+  readUserFactTool,
+} from './user-facts-tool.js';
 
 export { toolRegistry } from './registry.js';
 export type { ToolDefinition, ToolResult, ToolCall, ToolParameter } from './types.js';
@@ -29,6 +43,42 @@ export function getToolsByNames(names: string[]): import('./types.js').ToolDefin
 
 export function initializeTools(): void {
   console.log('Initializing tool system...');
+
+  // Register current time tool (always available for temporal awareness)
+  if (env.TOOLS_ENABLED) {
+    toolRegistry.register(timeTool);
+    console.log('✓ Current time tool registered');
+  }
+
+  // Register conversation metadata tool
+  if (env.TOOLS_ENABLED) {
+    toolRegistry.register(conversationMetadataTool);
+    console.log('✓ Conversation metadata tool registered');
+  }
+
+  // Register calendar tools
+  if (env.TOOLS_ENABLED) {
+    toolRegistry.register(addCalendarEventTool);
+    console.log('✓ Add calendar event tool registered');
+    toolRegistry.register(listCalendarEventsTool);
+    console.log('✓ List calendar events tool registered');
+    toolRegistry.register(getUpcomingEventsTool);
+    console.log('✓ Get upcoming events tool registered');
+    toolRegistry.register(updateCalendarEventTool);
+    console.log('✓ Update calendar event tool registered');
+    toolRegistry.register(deleteCalendarEventTool);
+    console.log('✓ Delete calendar event tool registered');
+  }
+
+  // Register user facts tools (for onboarding and personalization)
+  if (env.TOOLS_ENABLED) {
+    toolRegistry.register(saveUserFactTool);
+    console.log('✓ Save user fact tool registered');
+    toolRegistry.register(completeOnboardingTool);
+    console.log('✓ Complete onboarding tool registered');
+    toolRegistry.register(readUserFactTool);
+    console.log('✓ Read user fact tool registered');
+  }
 
   // Register web search tool if enabled
   if (env.TOOLS_ENABLED && env.WEB_SEARCH_ENABLED && env.BRAVE_SEARCH_API_KEY) {

@@ -90,6 +90,7 @@ export const env = {
   WORKSPACE_ROOT: strEnv(process.env.WORKSPACE_ROOT, process.cwd()),
   MEMORY_V2_ENABLED: process.env.MEMORY_V2_ENABLED === 'true',
   AUTH_ENFORCEMENT_ENABLED: process.env.AUTH_ENFORCEMENT_ENABLED === 'true',
+  DEFAULT_TIMEZONE: process.env.DEFAULT_TIMEZONE || 'UTC', // For time tool default timezone
   RATE_LIMITING_ENABLED: process.env.RATE_LIMITING_ENABLED === 'true',
   RATE_LIMIT_WINDOW_MS: parsePositiveInt(process.env.RATE_LIMIT_WINDOW_MS, 60000, 'RATE_LIMIT_WINDOW_MS'),
   RATE_LIMIT_RUN_PER_WINDOW: parsePositiveInt(process.env.RATE_LIMIT_RUN_PER_WINDOW, 8, 'RATE_LIMIT_RUN_PER_WINDOW'),

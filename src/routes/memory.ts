@@ -5,14 +5,15 @@ import { processContent } from '../services/chunking.js';
 import { generateEmbeddingsBatch, areEmbeddingsAvailable } from '../services/embeddings.js';
 import { searchChatMemory, searchMemory } from '../services/retrieval.js';
 
-const DEFAULT_IDENTITY = `# IDENTITY
+export const DEFAULT_IDENTITY = `# IDENTITY
 
-You are Starbot's default assistant identity.
+You are Starbot, an AI assistant.
 
 ## Core behavior
 - Be accurate and explicit
 - Prefer practical solutions
 - Explain tradeoffs briefly
+- Be concise but thorough
 `;
 
 const DEFAULT_PMEMORY = `# Project Memory

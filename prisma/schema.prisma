@@ -8,17 +8,19 @@ datasource db {
 }
 
 model User {
-  id           String      @id @default(uuid())
-  email        String      @unique
-  passwordHash String
-  name         String?
-  displayName  String?
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
-  token        String?
-  projects     Project[]
-  sessions     Session[]
-  facts        UserFact[]
+  id                String    @id @default(uuid())
+  email             String    @unique
+  passwordHash      String
+  name              String?
+  displayName       String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  token             String?
+  onboardingStatus  String    @default("NOT_STARTED") // NOT_STARTED, IN_PROGRESS, COMPLETED
+  lastOnboardingAt  DateTime?
+  projects          Project[]
+  sessions          Session[]
+  facts             UserFact[]
 
   @@map("users")
   calendars Calendar[]

@@ -5,10 +5,12 @@ import { getProvider } from '../../providers/index.js';
 import type { Provider, ProviderMessage } from '../../providers/types.js';
 import { parseToolCallsFromResponse, hasToolCallIntent } from './parser.js';
 import { ToolExecutor } from './executor.js';
-import type { ToolCallRequest, ExecutionResult, OrchestratorOptions, OrchestratorMessage } from './types.js';
+import type { ToolCallRequest, ExecutionResult, OrchestratorOptions, OrchestratorMessage, RunContext } from './types.js';
 import { env } from '../../env.js';
 
-const SYSTEM_PROMPT = `You are a tool-using assistant. When you need to use a tool, you MUST respond with ONLY raw JSON - no other text.
+const SYSTEM_PROMPT = `You are Starbot, an AI assistant.
+
+When you need to use a tool, respond with ONLY raw JSON - no other text.
 
 Output format (raw JSON, no markdown):
 {"tool":"tool_name","args":{"param":"value"}}
@@ -20,6 +22,11 @@ Tools:
 - bash: {"args":{"command":"ls -la"}}
 - calculator: {"args":{"expression":"2+2"}}
 - web_search: {"args":{"query":"search term"}}
+- get_current_time: {"args":{"format":"full"}} (use for time/date questions)
+- get_conversation_metadata: {"args":{}} (use for conversation timing/duration questions)
+- add_calendar_event: {"args":{"title":"Event name","startTime":"2026-03-01T14:00:00Z"}} (use to add calendar events)
+- list_calendar_events: {"args":{}} (use to query calendar)
+- get_upcoming_events: {"args":{"days":7}} (use to see upcoming events)
 
 IMPORTANT: Output ONLY the JSON. No explanations. No thinking. Just JSON.
 If you don't need a tool, respond with plain text (not JSON).`;
@@ -46,17 +53,19 @@ export class DeepSeekOrchestrator {
   async run(
     userInput: string,
     messages: OrchestratorMessage[] = [],
-    context?: { workspaceId?: string; projectId?: string }
+    context?: RunContext
   ): Promise<{
     response: string;
+    reasoning: string | null;
     toolResults: ExecutionResult[];
     iterations: number;
   }> {
     const toolResults: ExecutionResult[] = [];
-    const conversation: ProviderMessage[] = this.buildConversation(userInput, messages);
+    const conversation: ProviderMessage[] = this.buildConversation(userInput, messages, context?.identityContext);
 
     let iteration = 0;
     let lastResponse = '';
+    let lastReasoning = '';
     let needsMoreWork = true;
 
     while (needsMoreWork && iteration < this.maxIterations) {
@@ -65,6 +74,9 @@ export class DeepSeekOrchestrator {
       // Call DeepSeek
       const result = await this.callModel(conversation);
       lastResponse = result.response;
+      if (result.reasoning) {
+        lastReasoning = result.reasoning;
+      }
 
       // Check for tool calls from the model (native function calling)
       let toolCalls = result.toolCalls.map((tc: any, i: number) => ({
@@ -90,6 +102,20 @@ export class DeepSeekOrchestrator {
         // No tool calls, we're done
         needsMoreWork = false;
       } else {
+        // Set context for tools before executing
+        if (context) {
+          this.executor.setContext({
+            request: {} as any, // Not available in orchestrator context
+            projectId: context.projectId,
+            workspaceId: context.workspaceId,
+            chatId: context.chatId,
+            chatCreated: typeof context.chatCreated === 'string'
+              ? new Date(context.chatCreated)
+              : context.chatCreated,
+            messageCount: context.messageCount,
+            userTimezone: context.userTimezone,
+          });
+        }
         // Execute tools
         const execResults = await this.executor.executeAll(toolCalls);
         toolResults.push(...execResults);
@@ -135,6 +161,7 @@ export class DeepSeekOrchestrator {
 
     return {
       response: cleanedResponse,
+      reasoning: lastReasoning || null,
       toolResults,
       iterations: iteration,
     };
@@ -142,20 +169,40 @@ export class DeepSeekOrchestrator {
 
   private buildConversation(
     userInput: string,
-    existingMessages: OrchestratorMessage[]
+    existingMessages: OrchestratorMessage[],
+    identityContext?: string
   ): ProviderMessage[] {
-    // For now, just use system prompt + current message to avoid tool_call_id issues
-    // TODO: Properly handle conversation history with tool messages
+    // Build system prompt with identity if provided
+    const systemContent = identityContext
+      ? `${identityContext}\n\n${SYSTEM_PROMPT}`
+      : SYSTEM_PROMPT;
+
     const messages: ProviderMessage[] = [
-      { type: 'message', role: 'system', content: SYSTEM_PROMPT },
-      { type: 'message', role: 'user', content: userInput },
+      { type: 'message', role: 'system', content: systemContent },
     ];
+
+    // Add existing conversation messages (including timestamps)
+    for (const msg of existingMessages) {
+      messages.push({
+        type: 'message',
+        role: msg.role as 'user' | 'assistant' | 'system',
+        content: msg.content,
+      });
+    }
+
+    // Add current user input
+    messages.push({
+      type: 'message',
+      role: 'user',
+      content: userInput,
+    });
 
     return messages;
   }
 
-  private async callModel(messages: ProviderMessage[]): Promise<{ response: string; toolCalls: any[] }> {
+  private async callModel(messages: ProviderMessage[]): Promise<{ response: string; reasoning: string | null; toolCalls: any[] }> {
     let fullResponse = '';
+    let reasoningContent = '';
     let toolCalls: any[] = [];
 
     // Use the model from the orchestrator
@@ -165,21 +212,24 @@ export class DeepSeekOrchestrator {
       temperature: 0.7,
     })) {
       if (chunk.text) {
-        fullResponse += chunk.text;
+        // Check if this is reasoning content (DeepSeek R1)
+        if (chunk.reasoning) {
+          reasoningContent += chunk.text;
+        } else {
+          fullResponse += chunk.text;
+        }
       }
       if (chunk.tool_calls && chunk.tool_calls.length > 0) {
         toolCalls = chunk.tool_calls;
       }
     }
 
-    return { response: fullResponse, toolCalls };
+    return { response: fullResponse, reasoning: reasoningContent || null, toolCalls };
   }
 
   private cleanResponse(response: string): string {
     return response
-      // Remove thinking tags
-      .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
-      // Remove JSON blocks we added
+      // Remove JSON blocks we added (tool call attempts)
       .replace(/```json\s*\{[\s\S]*?\}\s*```/g, '')
       .replace(/\{[\s\S]*?"tool"[\s\S]*?\}/g, '')
       .trim();

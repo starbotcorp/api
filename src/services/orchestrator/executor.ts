@@ -3,6 +3,7 @@
 
 import { toolRegistry } from '../tools/index.js';
 import type { ToolCallRequest, ExecutionResult } from './types.js';
+import type { ToolContext } from '../tools/types.js';
 
 const TOOL_NAME_MAPPING: Record<string, string> = {
   'read_file': 'file.read',
@@ -16,13 +17,25 @@ const TOOL_NAME_MAPPING: Record<string, string> = {
   'bash': 'shell.exec',
   'shell': 'shell.exec',
   'run_command': 'shell.exec',
+  'get_current_time': 'get_current_time',
+  'get_conversation_metadata': 'get_conversation_metadata',
+  'add_calendar_event': 'add_calendar_event',
+  'list_calendar_events': 'list_calendar_events',
+  'get_upcoming_events': 'get_upcoming_events',
+  'update_calendar_event': 'update_calendar_event',
+  'delete_calendar_event': 'delete_calendar_event',
 };
 
 export class ToolExecutor {
   private timeoutMs: number;
+  private context?: ToolContext;
 
   constructor(timeoutMs: number = 30000) {
     this.timeoutMs = timeoutMs;
+  }
+
+  setContext(context: ToolContext): void {
+    this.context = context;
   }
 
   async execute(toolCall: ToolCallRequest): Promise<ExecutionResult> {
@@ -86,12 +99,14 @@ export class ToolExecutor {
       throw new Error(`Tool ${tool.name} has no handler`);
     }
 
-    // Execute with timeout
+    // Execute with timeout, passing context if available
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => reject(new Error('Tool execution timeout')), this.timeoutMs);
     });
 
-    const execPromise = Promise.resolve(handler(args));
+    const execPromise = Promise.resolve(
+      this.context ? handler(args, this.context) : handler(args)
+    );
 
     return Promise.race([execPromise, timeoutPromise]);
   }

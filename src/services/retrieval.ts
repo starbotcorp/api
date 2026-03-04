@@ -285,8 +285,20 @@ export async function getChatMemoryContext(
 /**
  * Get user facts for personalization context
  * Returns formatted string with relevant user information
+ * Respects onboarding status - returns empty if IN_PROGRESS
  */
 export async function getUserFactsContext(userId: string): Promise<string> {
+  // Check user's onboarding status first
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { onboardingStatus: true },
+  });
+
+  // If onboarding is in progress, return no facts (clean slate during restart)
+  if (user?.onboardingStatus === 'IN_PROGRESS') {
+    return '';
+  }
+
   const facts = await prisma.userFact.findMany({
     where: { userId },
     orderBy: { createdAt: 'asc' },
@@ -311,8 +323,33 @@ export async function getUserFactsContext(userId: string): Promise<string> {
 
 /**
  * Check if user has completed onboarding (has required facts)
+ * Uses the onboardingStatus field for the primary check
+ * Returns false if userId is undefined (auth disabled)
  */
-export async function isOnboardingComplete(userId: string): Promise<boolean> {
+export async function isOnboardingComplete(userId: string | undefined): Promise<boolean> {
+  // If no userId (auth disabled), return false to skip onboarding checks
+  if (!userId) {
+    return false;
+  }
+
+  // First check the status field
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { onboardingStatus: true },
+  });
+
+  // If status is COMPLETED, return true
+  if (user?.onboardingStatus === 'COMPLETED') {
+    return true;
+  }
+
+  // If status is IN_PROGRESS, return false
+  if (user?.onboardingStatus === 'IN_PROGRESS') {
+    return false;
+  }
+
+  // For NOT_STARTED (or null/undefined), fall back to checking facts
+  // This handles legacy users who may have facts but no status set
   const facts = await prisma.userFact.findMany({
     where: { userId },
     select: { factKey: true },

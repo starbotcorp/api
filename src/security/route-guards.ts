@@ -1,10 +1,18 @@
 import crypto from 'crypto';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { env } from '../env.js';
+import jwt from 'jsonwebtoken';
 
 interface RateBucket {
   count: number;
   resetAt: number;
+}
+
+interface TokenPayload {
+  userId: string;
+  email: string;
+  iat: number;
+  exp: number;
 }
 
 const rateBuckets = new Map<string, RateBucket>();

@@ -6,6 +6,7 @@ import 'dotenv/config';
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import jwt from 'jsonwebtoken';
 import { env, logConfiguration } from './env.js';
 import { projectRoutes } from './routes/projects.js';
 import { chatRoutes } from './routes/chats.js';
@@ -18,7 +19,11 @@ import { authRoutes } from './routes/auth.js';
 import { inferenceRoutes } from './routes/inference.js';
 import { tasksRoutes } from './routes/tasks.js';
 import { folderRoutes } from './routes/folders.js';
+import { calendarRoutes } from './routes/calendar.js';
+import { userRoutes } from './routes/users.js';
+import { onboardingRoutes } from './routes/onboarding.js';
 import { initializeTools } from './services/tools/index.js';
+import { extractAuthToken } from './security/route-guards.js';
 
 const PORT = env.PORT;
 const HOST = env.HOST;
@@ -63,6 +68,53 @@ await server.register(cors, {
   credentials: true,
 });
 
+// Auth middleware - decode JWT and set userId on request
+server.addHook('onRequest', async (request, reply) => {
+  // Skip auth for health endpoints
+  if (request.url === '/v1/health' || request.url === '/health') {
+    return;
+  }
+
+  // Extract token from Authorization header or cookie
+  let token: string | undefined;
+
+  // First check Authorization header
+  const authHeader = request.headers.authorization;
+  if (authHeader) {
+    token = authHeader.replace('Bearer ', '').trim();
+  }
+
+  // If no header token, check starbot_auth cookie
+  if (!token) {
+    const cookieHeader = request.headers.cookie;
+    if (cookieHeader) {
+      const cookies = cookieHeader.split(';').map(c => c.trim());
+      const authCookie = cookies.find(c => c.startsWith('starbot_auth='));
+      if (authCookie) {
+        token = authCookie.substring('starbot_auth='.length);
+      }
+    }
+  }
+
+  if (!token) {
+    // Debug: log when no token found
+    if (request.url.includes('/chats/main') || request.url.includes('/onboarding')) {
+      console.log(`[AUTH DEBUG] No token for ${request.url}. Cookie header:`, request.headers.cookie ? 'present' : 'missing');
+    }
+    return;
+  }
+
+  const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as { userId: string; email: string };
+    (request as any).userId = decoded.userId;
+    (request as any).userEmail = decoded.email;
+  } catch (err) {
+    // Token invalid - silently continue, individual routes will handle auth
+    console.log('[AUTH DEBUG] Token verification failed:', err);
+  }
+});
+
 // Main health endpoint with /v1 prefix
 server.get('/v1/health', async () => {
   return {
@@ -89,6 +141,9 @@ await server.register(authRoutes, { prefix: '/v1' });
 await server.register(inferenceRoutes, { prefix: '/v1' });
 await server.register(tasksRoutes, { prefix: '/v1' });
 await server.register(folderRoutes, { prefix: '/v1' });
+await server.register(calendarRoutes, { prefix: '/v1' });
+await server.register(userRoutes, { prefix: '/v1' });
+await server.register(onboardingRoutes, { prefix: '/v1' });
 
 // Initialize tools
 initializeTools();

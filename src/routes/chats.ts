@@ -256,16 +256,24 @@ export async function chatRoutes(server: FastifyInstance) {
     if (!requireAuthIfEnabled(request, reply)) return;
 
     const userId = (request as any).userId;
+    const userEmail = (request as any).userEmail;
 
     try {
-      // Get user's first project
-      const project = await prisma.project.findFirst({
+      // Get user's first project, or create one if it doesn't exist
+      let project = await prisma.project.findFirst({
         where: { userId },
         orderBy: { createdAt: 'asc' },
       });
 
       if (!project) {
-        return reply.code(404).send({ error: 'No project found' });
+        // Auto-create a default project for the user
+        project = await prisma.project.create({
+          data: {
+            userId,
+            name: 'My Project',
+            email: userEmail,
+          },
+        });
       }
 
       // Check if main thread exists

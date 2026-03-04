@@ -316,7 +316,7 @@ describe('Retrieval Service', () => {
       }
     });
 
-    it('should return empty string if no identity doc', async () => {
+    it('should return default identity if no identity doc exists', async () => {
       // Clean up any existing identity docs first
       await prisma.memoryDocument.deleteMany({
         where: {
@@ -326,7 +326,9 @@ describe('Retrieval Service', () => {
 
       const context = await getIdentityContext('test', 3);
 
-      expect(context).toBe('');
+      // Should return the default identity, not empty string
+      expect(context).toContain('Starbot');
+      expect(context).toContain('# IDENTITY');
     });
   });
 

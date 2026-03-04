@@ -1,6 +1,8 @@
 // Tool system types and interfaces
 // Defines the schema and interfaces for tools in Starbot
 
+import type { FastifyRequest } from 'fastify';
+
 export interface ToolParameter {
   name: string;
   type: 'string' | 'number' | 'boolean' | 'array' | 'object';
@@ -10,11 +12,21 @@ export interface ToolParameter {
   default?: any;
 }
 
+export interface ToolContext {
+  request: FastifyRequest;
+  projectId?: string;
+  workspaceId?: string;
+  chatId?: string;
+  chatCreated?: Date;
+  messageCount?: number;
+  userTimezone?: string;
+}
+
 export interface ToolDefinition {
   name: string;
   description: string;
   parameters: ToolParameter[];
-  execute: (args: Record<string, any>) => Promise<ToolResult>;
+  execute: (args: Record<string, any>, context?: ToolContext) => Promise<ToolResult>;
 }
 
 export interface ToolResult {

@@ -109,20 +109,21 @@ export async function generationRoutes(server: FastifyInstance) {
     // Check if this is a project-level chat (General Chat) and user needs onboarding
     const userId = (request as any).userId;
     const isProjectLevelChat = !chat.workspaceId && !chat.folderId;
-    const needsOnboarding = isProjectLevelChat && chat.messages.length <= 2 && !(await isOnboardingComplete(userId));
+    const userOnboardingComplete = await isOnboardingComplete(userId);
+    const needsOnboarding = isProjectLevelChat && !userOnboardingComplete;
 
-    // Check if this is a special onboarding trigger message
-    const lastUserMsg = chat.messages[chat.messages.length - 1];
-    const isOnboardingTrigger = lastUserMsg && lastUserMsg.role === 'user' && lastUserMsg.content === 'Start onboarding';
+    // Check if this is a special onboarding trigger message (from restart flow)
+    const lastUserMsgForTrigger = chat.messages[chat.messages.length - 1];
+    const isOnboardingTrigger = lastUserMsgForTrigger && lastUserMsgForTrigger.role === 'user' && lastUserMsgForTrigger.content === 'Start onboarding';
 
-    if (needsOnboarding && isOnboardingTrigger) {
-      // This is the onboarding trigger - send the onboarding greeting
+    // Handle explicit onboarding trigger (from restart flow)
+    if (isOnboardingTrigger && lastUserMsgForTrigger) {
       // Delete the trigger message so it doesn't clutter the conversation
       await prisma.message.delete({
-        where: { id: lastUserMsg.id },
+        where: { id: lastUserMsgForTrigger.id },
       });
 
-      // Send the onboarding greeting as if it came from Starbot
+      // Send the onboarding greeting
       const onboardingGreeting = `Hey there! I'm Starbot — your personal AI assistant. I'm here to help you stay organized, answer questions, and maybe even make you smile. Before we dive in, I'd love to get to know you a little better. Sound good?`;
 
       const assistantMessage = await prisma.message.create({
@@ -162,6 +163,35 @@ export async function generationRoutes(server: FastifyInstance) {
 
       reply.raw.end();
       return reply;
+    }
+
+    // If user needs onboarding and this is their first message, inject onboarding context
+    let onboardingContext = '';
+    if (needsOnboarding && chat.messages.length <= 1) {
+      onboardingContext = `# ONBOARDING MODE
+
+You are in onboarding mode. This user is new and you need to collect essential information about them conversationally.
+
+**Your Goals:**
+1. Start with a warm, friendly greeting introducing yourself as Starbot
+2. Collect the following information naturally through conversation:
+   - **Name** (required)
+   - **Timezone** (required - for reminders and scheduling)
+   - **Role** (required - e.g., developer, writer, student, etc.)
+   - **Preferences** (optional - communication style, interests, etc.)
+
+**Available Tools:**
+- \`save_user_fact\` - Save individual facts as you learn them
+- \`complete_onboarding\` - Call this when you have collected name, timezone, and role to finish onboarding
+
+**Style:**
+- Be warm, quirky, and approachable
+- Don't ask for all information at once - have a natural conversation
+- After collecting the essentials, summarize and ask if there's anything else they'd like to share
+- When done, call \`complete_onboarding\` with all collected facts
+
+Start by greeting the user and asking their name!
+`;
     }
 
     try {
@@ -513,6 +543,15 @@ When asked about time, date, or timing questions (including "how long have we be
         role: 'system',
         content: modeHints[body.mode] || modeHints.standard,
       });
+
+      // Inject onboarding context if user needs onboarding
+      if (onboardingContext) {
+        providerMessages.push({
+          type: 'message',
+          role: 'system',
+          content: onboardingContext,
+        });
+      }
 
       // Inject Codex header as system message so downstream model sees routing metadata
       if (codexHeader) {
