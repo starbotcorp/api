@@ -1,11 +1,25 @@
 // User profile routes
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import bcrypt from 'bcrypt';
 import { prisma } from '../db.js';
 import { requireAuthIfEnabled } from '../security/route-guards.js';
 
+const SALT_ROUNDS = 12;
+
 const UpdateProfileSchema = z.object({
   displayName: z.string().min(1).max(100).optional(),
+  personalityTone: z.number().int().min(0).max(2).optional(),
+  personalityEngagement: z.number().int().min(0).max(2).optional(),
+  traits: z.array(z.string()).optional(),
+  interests: z.array(z.string()).optional(),
+  preferences: z.record(z.unknown()).optional(),
+  philosophy: z.record(z.unknown()).optional(),
+});
+
+const ChangePasswordSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z.string().min(8),
 });
 
 const SetFactSchema = z.object({
@@ -31,6 +45,12 @@ export async function userRoutes(server: FastifyInstance) {
           name: true,
           displayName: true,
           createdAt: true,
+          personalityTone: true,
+          personalityEngagement: true,
+          traits: true,
+          interests: true,
+          preferences: true,
+          philosophy: true,
         },
       });
 
@@ -56,15 +76,30 @@ export async function userRoutes(server: FastifyInstance) {
     try {
       const body = UpdateProfileSchema.parse(request.body);
 
+      const updateData: Record<string, unknown> = {};
+      if (body.displayName !== undefined) updateData.displayName = body.displayName;
+      if (body.personalityTone !== undefined) updateData.personalityTone = body.personalityTone;
+      if (body.personalityEngagement !== undefined) updateData.personalityEngagement = body.personalityEngagement;
+      if (body.traits !== undefined) updateData.traits = JSON.stringify(body.traits);
+      if (body.interests !== undefined) updateData.interests = JSON.stringify(body.interests);
+      if (body.preferences !== undefined) updateData.preferences = JSON.stringify(body.preferences);
+      if (body.philosophy !== undefined) updateData.philosophy = JSON.stringify(body.philosophy);
+
       const user = await prisma.user.update({
         where: { id: userId },
-        data: body,
+        data: updateData,
         select: {
           id: true,
           email: true,
           name: true,
           displayName: true,
           createdAt: true,
+          personalityTone: true,
+          personalityEngagement: true,
+          traits: true,
+          interests: true,
+          preferences: true,
+          philosophy: true,
         },
       });
 
@@ -344,6 +379,50 @@ export async function userRoutes(server: FastifyInstance) {
     } catch (error) {
       return reply.code(500).send({
         error: 'Failed to restart main onboarding',
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // POST /v1/user/change-password - Change user password
+  server.post('/user/change-password', async (request, reply) => {
+    if (!requireAuthIfEnabled(request, reply)) return;
+
+    const userId = (request as any).userId;
+
+    try {
+      const body = ChangePasswordSchema.parse(request.body);
+
+      // Get current user with password hash
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { id: true, passwordHash: true },
+      });
+
+      if (!user) {
+        return reply.code(404).send({ error: 'User not found' });
+      }
+
+      // Verify current password
+      const isValid = await bcrypt.compare(body.currentPassword, user.passwordHash);
+      if (!isValid) {
+        return reply.code(401).send({ error: 'Current password is incorrect' });
+      }
+
+      // Hash and update new password
+      const newPasswordHash = await bcrypt.hash(body.newPassword, SALT_ROUNDS);
+      await prisma.user.update({
+        where: { id: userId },
+        data: { passwordHash: newPasswordHash },
+      });
+
+      return reply.send({ success: true, message: 'Password changed successfully' });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return reply.code(400).send({ error: 'Validation failed', details: error.errors });
+      }
+      return reply.code(500).send({
+        error: 'Failed to change password',
         message: error instanceof Error ? error.message : String(error),
       });
     }

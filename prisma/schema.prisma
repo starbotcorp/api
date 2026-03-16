@@ -8,22 +8,51 @@ datasource db {
 }
 
 model User {
-  id                String    @id @default(uuid())
-  email             String    @unique
-  passwordHash      String
-  name              String?
-  displayName       String?
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-  token             String?
-  onboardingStatus  String    @default("NOT_STARTED") // NOT_STARTED, IN_PROGRESS, COMPLETED
-  lastOnboardingAt  DateTime?
-  projects          Project[]
-  sessions          Session[]
-  facts             UserFact[]
+  id                    String     @id @default(uuid())
+  email                 String     @unique
+  passwordHash          String
+  name                  String?
+  displayName           String?
+  createdAt             DateTime   @default(now())
+  updatedAt             DateTime   @updatedAt
+  token                 String?
+  onboardingStatus      String     @default("NOT_STARTED") // NOT_STARTED, IN_PROGRESS, COMPLETED
+  lastOnboardingAt      DateTime?
+
+  // Personality grid: 0=low, 1=mid, 2=high
+  personalityTone       Int        @default(1) // 0=professional, 1=balanced, 2=casual
+  personalityEngagement Int        @default(1) // 0=supportive, 1=balanced, 2=challenging
+
+  // Profile data (JSON as text - SQLite)
+  traits                String     @default("[]")  // string[]
+  interests             String     @default("[]")  // string[]
+  preferences           String     @default("{}")  // { verbose?: bool, lists?: bool, ... }
+  philosophy            String     @default("{}")  // philosophical/worldview notes
+  abbrevIndex           String     @default("{}")  // { [short]: fullTerm } for compactor
+
+  projects   Project[]
+  sessions   Session[]
+  facts      UserFact[]
+  calendars  Calendar[]
+  settings   UserSettings?
 
   @@map("users")
-  calendars Calendar[]
+}
+
+model UserSettings {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  mode      String   @default("standard") // quick, standard, deep
+  auto      Boolean  @default(true)
+  thinking  Boolean  @default(false) // false = V3, true = R1
+  modelPrefs String? // provider:model override
+  theme     String   @default("system") // light, dark, system
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("user_settings")
 }
 
 model Calendar {
@@ -50,19 +79,21 @@ model Calendar {
 }
 
 model UserFact {
-  id        String   @id @default(uuid())
-  userId    String
-  factKey   String
-  factValue String
-  confidence Float   @default(1.0)
-  source    String   @default("onboarding")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id         String   @id @default(uuid())
+  userId     String
+  factKey    String
+  factValue  String
+  confidence Float    @default(1.0)
+  source     String   @default("onboarding")
+  status     String   @default("ACTIVE") // ACTIVE, PENDING, ARCHIVED
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, factKey])
   @@index([userId])
   @@index([factKey])
+  @@index([status])
   @@map("user_facts")
 }
 
@@ -85,11 +116,13 @@ model Session {
 }
 
 model Project {
-  id         String           @id @default(uuid())
-  name       String
-  userId     String?
-  createdAt  DateTime         @default(now())
-  email      String?
+  id        String           @id @default(uuid())
+  name      String
+  userId    String?
+  createdAt DateTime         @default(now())
+  email     String?
+  settings  String           @default("{}") // JSON: project-specific settings & tool allowlists
+  profile   String           @default("{}") // JSON: extracted project facts (status, bugs, decisions)
   chats      Chat[]
   folders    Folder[]
   memories   MemoryDocument[]
@@ -129,16 +162,19 @@ model Workspace {
 }
 
 model Chat {
-  id           String           @id @default(uuid())
-  projectId    String
-  workspaceId  String?
-  folderId     String?
-  title        String
-  clientSource String           @default("webgui")
-  isFavorite   Boolean          @default(false)
-  isMain       Boolean          @default(false)
-  createdAt    DateTime         @default(now())
-  updatedAt    DateTime         @updatedAt
+  id                 String   @id @default(uuid())
+  projectId          String
+  workspaceId        String?
+  folderId           String?
+  title              String
+  clientSource       String   @default("webgui")
+  isFavorite         Boolean  @default(false)
+  isMain             Boolean  @default(false)
+  compaction         String?  // JSON: structured compaction summary (set after /compact)
+  compactedAt        DateTime?
+  customInstructions String?  // Per-chat system prompt additions
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
   folder       Folder?          @relation(fields: [folderId], references: [id])
   workspace    Workspace?       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   project      Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)

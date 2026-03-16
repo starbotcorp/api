@@ -16,7 +16,7 @@ You are Starbot, an AI assistant.
 - Be concise but thorough
 `;
 
-const DEFAULT_PMEMORY = `# Project Memory
+export const DEFAULT_PMEMORY = `# Project Memory
 
 This document stores project-level context and conventions.
 
@@ -31,7 +31,7 @@ This document stores project-level context and conventions.
 - Use this to guide AI assistants about project preferences
 `;
 
-const DEFAULT_WORKSPACE_MEMORY = `# Workspace Memory
+export const DEFAULT_WORKSPACE_MEMORY = `# Workspace Memory
 
 This document stores workspace-specific context.
 
@@ -46,7 +46,7 @@ This document stores workspace-specific context.
 - Use this to guide context-aware operations
 `;
 
-const DEFAULT_CHAT_MEMORY = `# Chat Memory
+export const DEFAULT_CHAT_MEMORY = `# Chat Memory
 
 This document stores chat-specific context, decisions, and preferences.
 
@@ -60,6 +60,8 @@ This document stores chat-specific context, decisions, and preferences.
 - Remove stale or incorrect entries
 - Prefer short bullet lists
 `;
+
+
 
 const MemoryContentSchema = z.object({
   content: z.string(),

@@ -42,4 +42,5 @@ export interface RunContext {
   messageCount?: number;
   userTimezone?: string;
   identityContext?: string;  // Starbot identity to inject
+  isMainThread?: boolean;    // Main thread gets temporal + calendar tools
 }

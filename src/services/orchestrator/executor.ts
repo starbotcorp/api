@@ -5,6 +5,15 @@ import { toolRegistry } from '../tools/index.js';
 import type { ToolCallRequest, ExecutionResult } from './types.js';
 import type { ToolContext } from '../tools/types.js';
 
+const TEMPORAL_TOOL_NAMES = new Set([
+  'get_current_time',
+  'add_calendar_event',
+  'list_calendar_events',
+  'get_upcoming_events',
+  'update_calendar_event',
+  'delete_calendar_event',
+]);
+
 const TOOL_NAME_MAPPING: Record<string, string> = {
   'read_file': 'file.read',
   'write_file': 'fs.write_file',
@@ -29,6 +38,8 @@ const TOOL_NAME_MAPPING: Record<string, string> = {
 export class ToolExecutor {
   private timeoutMs: number;
   private context?: ToolContext;
+  // null = allow all; 'non-temporal' = block temporal tools
+  private toolMode: null | 'non-temporal' = null;
 
   constructor(timeoutMs: number = 30000) {
     this.timeoutMs = timeoutMs;
@@ -38,9 +49,23 @@ export class ToolExecutor {
     this.context = context;
   }
 
+  setAllowedTools(mode: null | 'non-temporal'): void {
+    this.toolMode = mode;
+  }
+
   async execute(toolCall: ToolCallRequest): Promise<ExecutionResult> {
     const startTime = Date.now();
     const toolName = TOOL_NAME_MAPPING[toolCall.tool] || toolCall.tool;
+
+    if (this.toolMode === 'non-temporal' && TEMPORAL_TOOL_NAMES.has(toolCall.tool)) {
+      return {
+        tool: toolCall.tool,
+        success: false,
+        result: '',
+        error: `Tool "${toolCall.tool}" is only available in the main thread.`,
+        durationMs: Date.now() - startTime,
+      };
+    }
 
     try {
       const tool = toolRegistry.get(toolName);

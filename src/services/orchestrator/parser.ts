@@ -22,17 +22,65 @@ const TOOL_NAMES = [
   'run_command',
 ];
 
+/**
+ * Extract complete JSON objects from a string using bracket counting.
+ * This properly handles nested objects unlike simple regex.
+ */
+function extractCompleteJsonObjects(str: string): object[] {
+  const objects: object[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escapeNext = false;
+
+  for (let i = 0; i < str.length; i++) {
+    const char = str[i];
+
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+
+    if (char === '\\' && inString) {
+      escapeNext = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (!inString) {
+      if (char === '{') {
+        if (depth === 0) {
+          start = i;
+        }
+        depth++;
+      } else if (char === '}') {
+        depth--;
+        if (depth === 0 && start !== -1) {
+          const jsonStr = str.slice(start, i + 1);
+          try {
+            objects.push(JSON.parse(jsonStr));
+          } catch {
+            // Invalid JSON, skip
+          }
+          start = -1;
+        }
+      }
+    }
+  }
+
+  return objects;
+}
+
 export function parseToolCallsFromResponse(response: string): ToolCallRequest[] {
   const toolCalls: ToolCallRequest[] = [];
 
-  console.log('[Parser] Received response, length:', response.length);
-  console.log('[Parser] First 200 chars:', response.slice(0, 200));
-
   // First, try to extract XML-like tool calls (DeepSeek often uses this format)
   const xmlToolCalls = parseXmlToolCalls(response);
-  console.log('[Parser] XML tool calls found:', xmlToolCalls.length);
   if (xmlToolCalls.length > 0) {
-    console.log('[Parser] XML tool calls:', JSON.stringify(xmlToolCalls));
     return xmlToolCalls;
   }
 
@@ -45,7 +93,6 @@ export function parseToolCallsFromResponse(response: string): ToolCallRequest[] 
   // Try to find JSON blocks in markdown code blocks first
   const codeBlockMatches = cleanedResponse.match(/```json\s*(\{[\s\S]*?\})\s*```/g);
   if (codeBlockMatches) {
-    console.log('[Parser] Found code blocks:', codeBlockMatches.length);
     for (const block of codeBlockMatches) {
       const jsonMatch = block.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
@@ -64,39 +111,27 @@ export function parseToolCallsFromResponse(response: string): ToolCallRequest[] 
       }
     }
     if (toolCalls.length > 0) {
-      console.log('[Parser] Tool calls from code blocks:', JSON.stringify(toolCalls));
       return toolCalls;
     }
   }
 
-  // Also try plain JSON objects with tool/args keys
-  // Match complete JSON objects - find {"tool":...} patterns
-  const jsonRegex = /\{"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*\{([^}]+)\}\s*\}/g;
-  let jsonMatch;
-  while ((jsonMatch = jsonRegex.exec(cleanedResponse)) !== null) {
-    const toolName = jsonMatch[1];
-    const argsStr = jsonMatch[2];
-    // Parse args
-    const args: Record<string, string> = {};
-    const argRegex = /"([^"]+)"\s*:\s*"([^"]*)"/g;
-    let argMatch;
-    while ((argMatch = argRegex.exec(argsStr)) !== null) {
-      args[argMatch[1]] = argMatch[2];
-    }
-    if (Object.keys(args).length > 0) {
+  // Use robust JSON extraction that handles nested objects
+  const jsonObjects = extractCompleteJsonObjects(cleanedResponse);
+  for (const obj of jsonObjects) {
+    const parsed = obj as Record<string, unknown>;
+    if (parsed.tool && parsed.args) {
       toolCalls.push({
-        tool: toolName,
-        args,
-        reasoning: 'Extracted from text',
+        tool: String(parsed.tool),
+        args: parsed.args as Record<string, unknown>,
+        reasoning: parsed.reasoning ? String(parsed.reasoning) : 'Extracted from text',
       });
     }
   }
-  console.log('[Parser] Extracted tool calls from regex:', JSON.stringify(toolCalls));
+
   if (toolCalls.length > 0) {
     return toolCalls;
   }
 
-  console.log('[Parser] Final tool calls:', JSON.stringify(toolCalls));
   return toolCalls;
 }
 

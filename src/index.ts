@@ -22,6 +22,10 @@ import { folderRoutes } from './routes/folders.js';
 import { calendarRoutes } from './routes/calendar.js';
 import { userRoutes } from './routes/users.js';
 import { onboardingRoutes } from './routes/onboarding.js';
+import { settingsRoutes } from './routes/settings.js';
+import { adminUserRoutes } from './routes/admin-users.js';
+import { compactionRoutes } from './routes/compaction.js';
+import { adminDocsRoutes } from './routes/admin-docs.js';
 import { initializeTools } from './services/tools/index.js';
 import { extractAuthToken } from './security/route-guards.js';
 
@@ -144,6 +148,10 @@ await server.register(folderRoutes, { prefix: '/v1' });
 await server.register(calendarRoutes, { prefix: '/v1' });
 await server.register(userRoutes, { prefix: '/v1' });
 await server.register(onboardingRoutes, { prefix: '/v1' });
+await server.register(settingsRoutes, { prefix: '/v1' });
+await server.register(adminUserRoutes, { prefix: '/v1' });
+await server.register(compactionRoutes, { prefix: '/v1' });
+await server.register(adminDocsRoutes, { prefix: '/v1' });
 
 // Initialize tools
 initializeTools();

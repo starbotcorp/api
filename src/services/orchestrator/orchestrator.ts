@@ -8,7 +8,27 @@ import { ToolExecutor } from './executor.js';
 import type { ToolCallRequest, ExecutionResult, OrchestratorOptions, OrchestratorMessage, RunContext } from './types.js';
 import { env } from '../../env.js';
 
-const SYSTEM_PROMPT = `You are Starbot, an AI assistant.
+const BASE_TOOLS = `- list_directory: {"args":{"path":"/directory/path"}}
+- read_file: {"args":{"path":"/file/path"}}
+- glob: {"args":{"pattern":"*.ts"}}
+- bash: {"args":{"command":"ls -la"}}
+- calculator: {"args":{"expression":"2+2"}}
+- web_search: {"args":{"query":"search term"}}
+- get_conversation_metadata: {"args":{}} (use for conversation timing/duration questions)
+- memory_search: {"args":{"query":"search term","scope":"all"}} (search across user facts, thread compactions, and project profiles; scope: "facts", "threads", "projects", or "all")
+- save_user_fact: {"args":{"fact_key":"key","fact_value":"value","confidence":1.0}} (save a fact about the user)
+- read_user_fact: {"args":{"fact_key":"key"}} (read a specific fact, or omit fact_key to get all facts)`;
+
+const TEMPORAL_TOOLS = `- get_current_time: {"args":{"format":"full"}} (use for time/date questions)
+- add_calendar_event: {"args":{"title":"Event name","startTime":"2026-03-01T14:00:00Z"}} (use to add calendar events)
+- list_calendar_events: {"args":{}} (use to query calendar)
+- get_upcoming_events: {"args":{"days":7}} (use to see upcoming events)
+- update_calendar_event: {"args":{"eventId":"id","title":"New name"}} (use to update events)
+- delete_calendar_event: {"args":{"eventId":"id"}} (use to delete events)`;
+
+export function buildOrchestratorSystemPrompt(isMainThread = false): string {
+  const tools = isMainThread ? `${BASE_TOOLS}\n${TEMPORAL_TOOLS}` : BASE_TOOLS;
+  return `You are Starbot, an AI assistant.
 
 When you need to use a tool, respond with ONLY raw JSON - no other text.
 
@@ -16,20 +36,13 @@ Output format (raw JSON, no markdown):
 {"tool":"tool_name","args":{"param":"value"}}
 
 Tools:
-- list_directory: {"args":{"path":"/directory/path"}}
-- read_file: {"args":{"path":"/file/path"}}
-- glob: {"args":{"pattern":"*.ts"}}
-- bash: {"args":{"command":"ls -la"}}
-- calculator: {"args":{"expression":"2+2"}}
-- web_search: {"args":{"query":"search term"}}
-- get_current_time: {"args":{"format":"full"}} (use for time/date questions)
-- get_conversation_metadata: {"args":{}} (use for conversation timing/duration questions)
-- add_calendar_event: {"args":{"title":"Event name","startTime":"2026-03-01T14:00:00Z"}} (use to add calendar events)
-- list_calendar_events: {"args":{}} (use to query calendar)
-- get_upcoming_events: {"args":{"days":7}} (use to see upcoming events)
+${tools}
 
 IMPORTANT: Output ONLY the JSON. No explanations. No thinking. Just JSON.
 If you don't need a tool, respond with plain text (not JSON).`;
+}
+
+export const ORCHESTRATOR_SYSTEM_PROMPT = buildOrchestratorSystemPrompt(false);
 
 export class DeepSeekOrchestrator {
   private provider: Provider;
@@ -61,7 +74,8 @@ export class DeepSeekOrchestrator {
     iterations: number;
   }> {
     const toolResults: ExecutionResult[] = [];
-    const conversation: ProviderMessage[] = this.buildConversation(userInput, messages, context?.identityContext);
+    const isMainThread = context?.isMainThread ?? false;
+    const conversation: ProviderMessage[] = this.buildConversation(userInput, messages, context?.identityContext, isMainThread);
 
     let iteration = 0;
     let lastResponse = '';
@@ -115,6 +129,7 @@ export class DeepSeekOrchestrator {
             messageCount: context.messageCount,
             userTimezone: context.userTimezone,
           });
+          this.executor.setAllowedTools(isMainThread ? null : 'non-temporal');
         }
         // Execute tools
         const execResults = await this.executor.executeAll(toolCalls);
@@ -170,12 +185,14 @@ export class DeepSeekOrchestrator {
   private buildConversation(
     userInput: string,
     existingMessages: OrchestratorMessage[],
-    identityContext?: string
+    identityContext?: string,
+    isMainThread = false
   ): ProviderMessage[] {
+    const orchestratorPrompt = buildOrchestratorSystemPrompt(isMainThread);
     // Build system prompt with identity if provided
     const systemContent = identityContext
-      ? `${identityContext}\n\n${SYSTEM_PROMPT}`
-      : SYSTEM_PROMPT;
+      ? `${identityContext}\n\n${orchestratorPrompt}`
+      : orchestratorPrompt;
 
     const messages: ProviderMessage[] = [
       { type: 'message', role: 'system', content: systemContent },

@@ -96,11 +96,13 @@ export async function onboardingRoutes(server: FastifyInstance) {
               factValue: valueStr,
               source: 'onboarding',
               confidence: 1.0,
+              status: 'ACTIVE',
             },
             update: {
               factValue: valueStr,
               source: 'onboarding',
               confidence: 1.0,
+              status: 'ACTIVE',
               updatedAt: new Date(),
             },
           });

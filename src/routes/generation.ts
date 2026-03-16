@@ -6,14 +6,16 @@ import { interpretUserMessage } from '../services/interpreter.js';
 import { classifyWithCodex, serializeHeader, stripHeader, type CodexHeader } from '../services/codex-router.js';
 import { getProvider } from '../providers/index.js';
 import type { ProviderMessage, ToolCall } from '../providers/types.js';
-import { getChatMemoryContext, getIdentityContext, getRelevantContext, getUserFactsContext, isOnboardingComplete } from '../services/retrieval.js';
+import { getChatMemoryContext, getIdentityContext, getRelevantContext, isOnboardingComplete } from '../services/retrieval.js';
+import { assembleContext } from '../services/context-loader.js';
+import { ONBOARDING_PROMPT } from '../services/prompts.js';
 import { formatWebSearchContext, searchWeb } from '../services/web-search.js';
 import { toolRegistry, getToolsByNames } from '../services/tools/index.js';
 import { DeepSeekOrchestrator } from '../services/orchestrator/index.js';
 import { env } from '../env.js';
 import { runTriage } from '../services/triage/index.js';
 import { enforceRateLimitIfEnabled, requireAuthIfEnabled, getRealClientIP } from '../security/route-guards.js';
-import { getUserTimezone, getCurrentTimeInTimezone, formatTimeInTimezone } from '../services/timezone.js';
+import { getUserTimezone } from '../services/timezone.js';
 import { generateAndUpdateTitle } from '../services/title-generator.js';
 import {
   RunChatSchema,
@@ -106,11 +108,11 @@ export async function generationRoutes(server: FastifyInstance) {
       }
     };
 
-    // Check if this is a project-level chat (General Chat) and user needs onboarding
+    // Check if this is the main thread and user needs onboarding
+    // Onboarding ONLY happens in the main thread (isMain: true)
     const userId = (request as any).userId;
-    const isProjectLevelChat = !chat.workspaceId && !chat.folderId;
     const userOnboardingComplete = await isOnboardingComplete(userId);
-    const needsOnboarding = isProjectLevelChat && !userOnboardingComplete;
+    const needsOnboarding = chat.isMain && !userOnboardingComplete;
 
     // Check if this is a special onboarding trigger message (from restart flow)
     const lastUserMsgForTrigger = chat.messages[chat.messages.length - 1];
@@ -166,33 +168,7 @@ export async function generationRoutes(server: FastifyInstance) {
     }
 
     // If user needs onboarding and this is their first message, inject onboarding context
-    let onboardingContext = '';
-    if (needsOnboarding && chat.messages.length <= 1) {
-      onboardingContext = `# ONBOARDING MODE
-
-You are in onboarding mode. This user is new and you need to collect essential information about them conversationally.
-
-**Your Goals:**
-1. Start with a warm, friendly greeting introducing yourself as Starbot
-2. Collect the following information naturally through conversation:
-   - **Name** (required)
-   - **Timezone** (required - for reminders and scheduling)
-   - **Role** (required - e.g., developer, writer, student, etc.)
-   - **Preferences** (optional - communication style, interests, etc.)
-
-**Available Tools:**
-- \`save_user_fact\` - Save individual facts as you learn them
-- \`complete_onboarding\` - Call this when you have collected name, timezone, and role to finish onboarding
-
-**Style:**
-- Be warm, quirky, and approachable
-- Don't ask for all information at once - have a natural conversation
-- After collecting the essentials, summarize and ask if there's anything else they'd like to share
-- When done, call \`complete_onboarding\` with all collected facts
-
-Start by greeting the user and asking their name!
-`;
-    }
+    const onboardingContext = (needsOnboarding && chat.messages.length <= 1) ? ONBOARDING_PROMPT : '';
 
     try {
       // 0. Inject task context if chat has associated tasks
@@ -479,64 +455,14 @@ Start by greeting the user and asking their name!
       // --- Build provider messages ---
       const providerMessages: ProviderMessage[] = [];
 
-      // Get user's timezone for temporal context
+      // Get user's timezone for orchestrator context (tool execution)
       const clientIP = getRealClientIP(request);
       const userTimezone = await getUserTimezone(request, clientIP);
-      const now = new Date();
-      const currentTimeUTC = now.toISOString();
-      const currentTimeUser = getCurrentTimeInTimezone(userTimezone);
-      const chatStartedUser = formatTimeInTimezone(chat.createdAt, userTimezone);
 
-      // Calculate elapsed time since chat started
-      const elapsedMs = now.getTime() - chat.createdAt.getTime();
-      const elapsedMinutes = Math.floor(elapsedMs / 60000);
-      const elapsedHours = Math.floor(elapsedMs / 3600000);
-      const elapsedDays = Math.floor(elapsedMs / 86400000);
-      let elapsedFormatted = '';
-      if (elapsedDays > 0) {
-        elapsedFormatted = `${elapsedDays} day${elapsedDays > 1 ? 's' : ''}`;
-      } else if (elapsedHours > 0) {
-        elapsedFormatted = `${elapsedHours} hour${elapsedHours > 1 ? 's' : ''}`;
-      } else if (elapsedMinutes > 0) {
-        elapsedFormatted = `${elapsedMinutes} minute${elapsedMinutes > 1 ? 's' : ''}`;
-      } else {
-        elapsedFormatted = 'less than a minute';
-      }
-
-      server.log.info({ requestId, chatId, userTimezone, currentTimeUTC, currentTimeUser, elapsedFormatted }, 'Temporal context');
-
-      // Add mode hint to guide response depth (with temporal awareness built in)
       const modeHints: Record<string, string> = {
-        quick: `RESPONSE STYLE: Be brief and direct. Focus on the essential answer without extensive elaboration.
-
-TEMPORAL AWARENESS:
-- User's timezone: ${userTimezone}
-- Current time (UTC): ${currentTimeUTC}
-- Current time (user's timezone): ${currentTimeUser}
-- Conversation started: ${chatStartedUser}
-- Time elapsed since conversation started: ${elapsedFormatted}
-
-When asked about time, date, or timing questions (including "how long have we been talking"), use this information.`,
-        standard: `RESPONSE STYLE: Provide a balanced response with reasonable detail and clarity.
-
-TEMPORAL AWARENESS:
-- User's timezone: ${userTimezone}
-- Current time (UTC): ${currentTimeUTC}
-- Current time (user's timezone): ${currentTimeUser}
-- Conversation started: ${chatStartedUser}
-- Time elapsed since conversation started: ${elapsedFormatted}
-
-When asked about time, date, or timing questions (including "how long have we been talking"), use this information.`,
-        deep: `RESPONSE STYLE: Be thorough and comprehensive. Explore nuances, provide detailed explanations, and consider edge cases.
-
-TEMPORAL AWARENESS:
-- User's timezone: ${userTimezone}
-- Current time (UTC): ${currentTimeUTC}
-- Current time (user's timezone): ${currentTimeUser}
-- Conversation started: ${chatStartedUser}
-- Time elapsed since conversation started: ${elapsedFormatted}
-
-When asked about time, date, or timing questions (including "how long have we been talking"), use this information.`,
+        quick: `RESPONSE STYLE: Be brief and direct. Focus on the essential answer without extensive elaboration.`,
+        standard: `RESPONSE STYLE: Provide a balanced response with reasonable detail and clarity.`,
+        deep: `RESPONSE STYLE: Be thorough and comprehensive. Explore nuances, provide detailed explanations, and consider edge cases.`,
       };
       providerMessages.push({
         type: 'message',
@@ -570,18 +496,31 @@ When asked about time, date, or timing questions (including "how long have we be
         });
       }
 
-      // Inject user facts for personalization
+      // Inject user profile + facts + compaction + project profile + custom instructions
       try {
-        const userFactsContext = await getUserFactsContext(userId);
-        if (userFactsContext) {
-          providerMessages.push({
-            type: 'message',
-            role: 'system',
-            content: userFactsContext,
-          });
+        const ctx = await assembleContext({
+          userId,
+          chatId: chat.id,
+          projectId: chat.projectId,
+        });
+
+        if (ctx.profileBlock) {
+          providerMessages.push({ type: 'message', role: 'system', content: ctx.profileBlock });
+        }
+        if (ctx.factsBlock) {
+          providerMessages.push({ type: 'message', role: 'system', content: ctx.factsBlock });
+        }
+        if (ctx.compactionBlock) {
+          providerMessages.push({ type: 'message', role: 'system', content: ctx.compactionBlock });
+        }
+        if (ctx.projectProfileBlock) {
+          providerMessages.push({ type: 'message', role: 'system', content: ctx.projectProfileBlock });
+        }
+        if (ctx.customInstructionsBlock) {
+          providerMessages.push({ type: 'message', role: 'system', content: ctx.customInstructionsBlock });
         }
       } catch (err) {
-        server.log.warn({ err, requestId, userId }, 'User facts retrieval failed');
+        server.log.warn({ err, requestId, userId }, 'Context assembly failed');
       }
 
       if (chatMemoryContext) {
@@ -637,11 +576,25 @@ When asked about time, date, or timing questions (including "how long have we be
       );
 
       // --- Selective tool injection ---
+      // Tool names restricted to the main thread (temporal + calendar)
+      const MAIN_THREAD_ONLY_TOOLS = new Set([
+        'get_current_time',
+        'add_calendar_event',
+        'list_calendar_events',
+        'get_upcoming_events',
+        'update_calendar_event',
+        'delete_calendar_event',
+      ]);
+
       // Codex header tells us exactly which tools to enable; legacy enables all
       const shouldUseTools = env.TOOLS_ENABLED && toolRegistry.getAll().length > 0;
-      const activeTools = (codexHeader && codexHeader.tools.length > 0)
+      const candidateTools = (codexHeader && codexHeader.tools.length > 0)
         ? getToolsByNames(codexHeader.tools)
         : (shouldUseTools ? toolRegistry.getAll() : []);
+      // Strip temporal/calendar tools from non-main threads
+      const activeTools = chat.isMain
+        ? candidateTools
+        : candidateTools.filter(t => !MAIN_THREAD_ONLY_TOOLS.has(t.name));
       const toolsEnabled = shouldUseTools && activeTools.length > 0;
       const maxToolIterations = 5;
       let toolIterations = 0;
@@ -682,6 +635,7 @@ When asked about time, date, or timing questions (including "how long have we be
             messageCount: chat.messages.length,
             userTimezone: userTimezone,
             identityContext: identityContext || '',  // Pass the Starbot identity
+            isMainThread: chat.isMain,
           }
         );
 
@@ -726,35 +680,74 @@ When asked about time, date, or timing questions (including "how long have we be
           });
         }
 
-        // Save assistant message (with thinking tags included)
-        await prisma.message.create({
-          data: {
-            chatId,
-            role: 'assistant',
-            content: fullResponse,
-          },
-        });
+        // Save assistant message (with thinking tags included) with retry logic
+        let assistantMessageSaved = false;
+        let saveAttempts = 0;
+        const maxSaveAttempts = 3;
+
+        while (!assistantMessageSaved && saveAttempts < maxSaveAttempts) {
+          saveAttempts++;
+          try {
+            await prisma.message.create({
+              data: {
+                chatId,
+                role: 'assistant',
+                content: fullResponse,
+              },
+            });
+            assistantMessageSaved = true;
+          } catch (dbError) {
+            server.log.error({ err: dbError, chatId, attempt: saveAttempts }, 'Failed to save assistant message');
+            if (saveAttempts < maxSaveAttempts) {
+              // Wait briefly before retry
+              await new Promise(resolve => setTimeout(resolve, 100));
+            } else {
+              // Final attempt failed - send error event but don't lose the streamed content
+              sendEvent('error', {
+                type: 'persistence_error',
+                message: 'Failed to save message to database after multiple attempts',
+                recoverable: true,
+                content_preserved: true,
+              });
+            }
+          }
+        }
 
         // Update chat title and generate smart title in background
+        // Re-fetch chat to get any title changes from tools (e.g., complete_onboarding)
+        const updatedChat = await prisma.chat.findUnique({
+          where: { id: chatId },
+          select: { title: true, isMain: true },
+        });
+
         const isNewChat = chat.title === 'New Chat';
-        const initialTitle = isNewChat
-          ? interpretedUserMessage.slice(0, 50) + (interpretedUserMessage.length > 50 ? '...' : '')
-          : chat.title;
+        const titleChangedByTool = updatedChat?.title !== chat.title;
+
+        // Determine final title:
+        // - If tool changed the title (e.g., onboarding complete), keep it
+        // - If new chat, use user message as initial title
+        // - Otherwise keep existing title
+        let finalTitle = chat.title;
+        if (titleChangedByTool) {
+          finalTitle = updatedChat?.title || chat.title;
+        } else if (isNewChat) {
+          finalTitle = interpretedUserMessage.slice(0, 50) + (interpretedUserMessage.length > 50 ? '...' : '');
+        }
 
         const updatedAt = new Date();
         await prisma.chat.update({
           where: { id: chatId },
-          data: { updatedAt, title: initialTitle },
+          data: { updatedAt, title: finalTitle },
         });
 
         sendEvent('chat.updated', {
           id: chatId,
-          title: initialTitle,
+          title: finalTitle,
           updatedAt: updatedAt.toISOString(),
         });
 
-        // Generate smart title in background for new chats
-        if (isNewChat) {
+        // Generate smart title in background for new chats (not main thread)
+        if (isNewChat && !chat.isMain) {
           generateAndUpdateTitle(
             chatId,
             lastUserMsg.content,
@@ -1078,20 +1071,65 @@ When asked about time, date, or timing questions (including "how long have we be
       // 7. Strip any header artifacts from response before persisting
       const cleanResponse = stripHeader(fullResponse);
 
-      // 8. Save assistant message
-      const assistantMessage = await prisma.message.create({
-        data: {
-          chatId,
-          role: 'assistant',
-          content: cleanResponse,
-        },
-      });
+      // 8. Save assistant message with retry logic
+      // Initialize with fallback to satisfy TypeScript's definite assignment check
+      let assistantMessage: { id: string; chatId: string; role: string; content: string; createdAt: Date } = {
+        id: `msg-fallback-${Date.now()}`,
+        chatId,
+        role: 'assistant',
+        content: cleanResponse,
+        createdAt: new Date(),
+      };
+      let saveAttempts = 0;
+      const maxSaveAttempts = 3;
+
+      for (saveAttempts = 1; saveAttempts <= maxSaveAttempts; saveAttempts++) {
+        try {
+          assistantMessage = await prisma.message.create({
+            data: {
+              chatId,
+              role: 'assistant',
+              content: cleanResponse,
+            },
+          });
+          break; // Success, exit loop
+        } catch (dbError) {
+          server.log.error({ err: dbError, chatId, attempt: saveAttempts }, 'Failed to save assistant message');
+          if (saveAttempts < maxSaveAttempts) {
+            // Wait briefly before retry
+            await new Promise(resolve => setTimeout(resolve, 100));
+          } else {
+            // Final attempt failed - keep the fallback object and notify client
+            sendEvent('error', {
+              type: 'persistence_error',
+              message: 'Failed to save message to database after multiple attempts',
+              recoverable: true,
+              content_preserved: true,
+            });
+          }
+        }
+      }
 
       // 9. Update chat title if needed
+      // Re-fetch chat to get any title changes from tools (e.g., complete_onboarding)
+      const updatedChatAfterTools = await prisma.chat.findUnique({
+        where: { id: chatId },
+        select: { title: true, isMain: true },
+      });
+
       const isNewChat = chat.title === 'New Chat';
-      const initialTitle = isNewChat
-        ? interpretedUserMessage.slice(0, 50) + (interpretedUserMessage.length > 50 ? '...' : '')
-        : chat.title;
+      const titleChangedByTool = updatedChatAfterTools?.title !== chat.title;
+
+      // Determine final title:
+      // - If tool changed the title (e.g., onboarding complete), keep it
+      // - If new chat, use user message as initial title
+      // - Otherwise keep existing title
+      let finalTitle = chat.title;
+      if (titleChangedByTool) {
+        finalTitle = updatedChatAfterTools?.title || chat.title;
+      } else if (isNewChat) {
+        finalTitle = interpretedUserMessage.slice(0, 50) + (interpretedUserMessage.length > 50 ? '...' : '');
+      }
 
       const updatedAt = new Date();
 
@@ -1099,12 +1137,18 @@ When asked about time, date, or timing questions (including "how long have we be
         where: { id: chatId },
         data: {
           updatedAt,
-          title: initialTitle,
+          title: finalTitle,
         },
       });
 
-      // 9b. Generate smart title in background for new chats
-      if (isNewChat) {
+      sendEvent('chat.updated', {
+        id: chatId,
+        title: finalTitle,
+        updatedAt: updatedAt.toISOString(),
+      });
+
+      // 9b. Generate smart title in background for new chats (not main thread)
+      if (isNewChat && !chat.isMain) {
         generateAndUpdateTitle(
           chatId,
           lastUserMsg.content,
@@ -1158,7 +1202,7 @@ When asked about time, date, or timing questions (including "how long have we be
 
       sendEvent('chat.updated', {
         id: chatId,
-        title: initialTitle,
+        title: finalTitle,
         updatedAt: updatedAt.toISOString(),
       });
 

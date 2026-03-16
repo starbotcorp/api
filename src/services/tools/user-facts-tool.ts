@@ -10,7 +10,7 @@ import { prisma } from '../../db.js';
  */
 export const saveUserFactTool: ToolDefinition = {
   name: 'save_user_fact',
-  description: 'Save a fact about the user. Use this when you learn new information about the user (name, timezone, role, preferences, etc.). This helps personalize future conversations.',
+  description: 'Save a fact about the user. Use this when you learn new information about the user (name, timezone, role, preferences, etc.). During onboarding, facts are saved as PENDING and promoted to ACTIVE on completion. Otherwise facts are saved as ACTIVE immediately.',
   parameters: [
     {
       name: 'fact_key',
@@ -21,8 +21,15 @@ export const saveUserFactTool: ToolDefinition = {
     {
       name: 'fact_value',
       type: 'string',
-      description: 'The value of the fact',
+      description: 'The value of the fact (string, or JSON-serializable data)',
       required: true,
+    },
+    {
+      name: 'confidence',
+      type: 'number',
+      description: 'Confidence score from 0.0 to 1.0 (default 1.0). Use lower values for inferred or uncertain facts.',
+      required: false,
+      default: 1.0,
     },
     {
       name: 'source',
@@ -34,9 +41,8 @@ export const saveUserFactTool: ToolDefinition = {
   ],
   execute: async (args, context): Promise<ToolResult> => {
     const { fact_key, fact_value, source = 'conversation' } = args;
+    const confidence = typeof args.confidence === 'number' ? Math.max(0, Math.min(1, args.confidence)) : 1.0;
 
-    // We need a user ID from context - for now we'll need to get it from the request
-    // The context should have the request object with userId attached
     const userId = (context?.request as any)?.userId;
 
     if (!userId) {
@@ -47,6 +53,14 @@ export const saveUserFactTool: ToolDefinition = {
     }
 
     try {
+      // Check onboarding status to determine PENDING vs ACTIVE
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { onboardingStatus: true },
+      });
+
+      const status = user?.onboardingStatus === 'IN_PROGRESS' ? 'PENDING' : 'ACTIVE';
+
       const fact = await prisma.userFact.upsert({
         where: {
           userId_factKey: {
@@ -59,12 +73,14 @@ export const saveUserFactTool: ToolDefinition = {
           factKey: fact_key,
           factValue: fact_value,
           source,
-          confidence: 1.0,
+          confidence,
+          status,
         },
         update: {
           factValue: fact_value,
           source,
-          confidence: 1.0,
+          confidence,
+          status,
           updatedAt: new Date(),
         },
       });
@@ -77,6 +93,8 @@ export const saveUserFactTool: ToolDefinition = {
             key: fact.factKey,
             value: fact.factValue,
             source: fact.source,
+            confidence: fact.confidence,
+            status: fact.status,
           },
         }),
       };
@@ -172,6 +190,22 @@ export const completeOnboardingTool: ToolDefinition = {
             lastOnboardingAt: new Date(),
           },
         });
+
+        // Rename main thread from "Onboarding" to "Main Thread"
+        // Find the user's main thread and update its title
+        const mainThread = await tx.chat.findFirst({
+          where: {
+            project: { userId },
+            isMain: true,
+          },
+        });
+
+        if (mainThread) {
+          await tx.chat.update({
+            where: { id: mainThread.id },
+            data: { title: 'Main Thread' },
+          });
+        }
       });
 
       return {
@@ -198,13 +232,13 @@ export const completeOnboardingTool: ToolDefinition = {
  */
 export const readUserFactTool: ToolDefinition = {
   name: 'read_user_fact',
-  description: 'Read a stored fact about the user. Use this to recall information the user has previously shared.',
+  description: 'Read stored facts about the user. If fact_key is provided, returns that specific fact. If omitted, returns all ACTIVE facts.',
   parameters: [
     {
       name: 'fact_key',
       type: 'string',
-      description: 'The key/label for the fact to retrieve (e.g., "name", "timezone")',
-      required: true,
+      description: 'The key/label for the fact to retrieve (e.g., "name", "timezone"). Omit to retrieve all ACTIVE facts.',
+      required: false,
     },
   ],
   execute: async (args, context): Promise<ToolResult> => {
@@ -219,19 +253,37 @@ export const readUserFactTool: ToolDefinition = {
     }
 
     try {
-      // Check onboarding status first
       const user = await prisma.user.findUnique({
         where: { id: userId },
         select: { onboardingStatus: true },
       });
 
-      // If onboarding is in progress, return empty
       if (user?.onboardingStatus === 'IN_PROGRESS') {
         return {
           success: true,
           content: JSON.stringify({
             message: 'Onboarding in progress - facts temporarily unavailable',
-            fact: null,
+            facts: [],
+          }),
+        };
+      }
+
+      // If no key provided, return all ACTIVE facts
+      if (!fact_key) {
+        const facts = await prisma.userFact.findMany({
+          where: { userId, status: 'ACTIVE' },
+          orderBy: { createdAt: 'asc' },
+        });
+
+        return {
+          success: true,
+          content: JSON.stringify({
+            facts: facts.map(f => ({
+              key: f.factKey,
+              value: f.factValue,
+              source: f.source,
+              confidence: f.confidence,
+            })),
           }),
         };
       }
@@ -250,7 +302,7 @@ export const readUserFactTool: ToolDefinition = {
           success: true,
           content: JSON.stringify({
             message: `No fact found with key "${fact_key}"`,
-            fact: null,
+            facts: [],
           }),
         };
       }
@@ -258,12 +310,12 @@ export const readUserFactTool: ToolDefinition = {
       return {
         success: true,
         content: JSON.stringify({
-          fact: {
+          facts: [{
             key: fact.factKey,
             value: fact.factValue,
             source: fact.source,
             confidence: fact.confidence,
-          },
+          }],
         }),
       };
     } catch (error) {

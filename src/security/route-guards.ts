@@ -165,3 +165,27 @@ export function enforceRateLimitIfEnabled(
 
 // Export for testing
 export { getRealClientIP, isTrustedProxy };
+
+// Admin authorization helper - checks if the authenticated user is an admin
+export function requireAdmin(request: FastifyRequest, reply: FastifyReply): boolean {
+  const userEmail = (request as any).userEmail;
+
+  if (!userEmail) {
+    reply.code(401).send({
+      error: 'unauthorized',
+      message: 'Authentication required',
+    });
+    return false;
+  }
+
+  const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+  if (!adminEmails.includes(userEmail.toLowerCase())) {
+    reply.code(403).send({
+      error: 'forbidden',
+      message: 'Admin access required',
+    });
+    return false;
+  }
+
+  return true;
+}

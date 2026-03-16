@@ -27,6 +27,7 @@ import {
   completeOnboardingTool,
   readUserFactTool,
 } from './user-facts-tool.js';
+import { memorySearchTool } from './memory-search-tool.js';
 
 export { toolRegistry } from './registry.js';
 export type { ToolDefinition, ToolResult, ToolCall, ToolParameter } from './types.js';
@@ -78,6 +79,8 @@ export function initializeTools(): void {
     console.log('✓ Complete onboarding tool registered');
     toolRegistry.register(readUserFactTool);
     console.log('✓ Read user fact tool registered');
+    toolRegistry.register(memorySearchTool);
+    console.log('✓ Memory search tool registered');
   }
 
   // Register web search tool if enabled

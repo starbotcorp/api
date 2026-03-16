@@ -4,7 +4,7 @@
 import { getProvider } from '../providers/index.js';
 import { prisma } from '../db.js';
 
-const TITLE_PROMPT = `Generate a very short title (3-6 words max) for a chat that starts with this message.
+export const TITLE_PROMPT = `Generate a very short title (3-6 words max) for a chat that starts with this message.
 
 Rules:
 - Maximum 6 words

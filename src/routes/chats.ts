@@ -286,10 +286,18 @@ export async function chatRoutes(server: FastifyInstance) {
 
       // If no main thread exists, create one
       if (!mainThread) {
+        // Check if user needs onboarding to determine initial title
+        const user = await prisma.user.findUnique({
+          where: { id: userId },
+          select: { onboardingStatus: true },
+        });
+        const needsOnboarding = user?.onboardingStatus !== 'COMPLETED';
+        const initialTitle = needsOnboarding ? 'Onboarding' : 'Main Thread';
+
         mainThread = await prisma.chat.create({
           data: {
             projectId: project.id,
-            title: 'Main Thread',
+            title: initialTitle,
             clientSource: 'webgui',
             isMain: true,
           },

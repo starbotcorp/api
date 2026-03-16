@@ -102,6 +102,9 @@ export const env = {
     'RATE_LIMIT_COMPLETION_PER_WINDOW',
   ),
 
+  // Admin
+  ADMIN_EMAILS: (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean),
+
   // Logging
   LOG_LEVEL: process.env.LOG_LEVEL || 'info',
 };

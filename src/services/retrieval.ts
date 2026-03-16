@@ -300,7 +300,7 @@ export async function getUserFactsContext(userId: string): Promise<string> {
   }
 
   const facts = await prisma.userFact.findMany({
-    where: { userId },
+    where: { userId, status: 'ACTIVE' },
     orderBy: { createdAt: 'asc' },
   });
 
@@ -308,15 +308,7 @@ export async function getUserFactsContext(userId: string): Promise<string> {
     return '';
   }
 
-  const factMap = new Map<string, string>();
-  for (const fact of facts) {
-    factMap.set(fact.factKey, fact.factValue);
-  }
-
-  const factDescriptions: string[] = [];
-  for (const [key, value] of factMap.entries()) {
-    factDescriptions.push(`${key}: ${value}`);
-  }
+  const factDescriptions = facts.map(f => `${f.factKey}: ${f.factValue}`);
 
   return `# User Facts\n\n${factDescriptions.join('\n')}\n`;
 }
